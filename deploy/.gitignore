@@ -1,0 +1,11 @@
+# Environment file with secrets
+.env
+
+# Generated OpenClaw config (contains tokens)
+configs/openclaw.json
+
+# SSL certificates
+certs/*.pem
+certs/*.crt
+certs/*.key
+!certs/.gitkeep
