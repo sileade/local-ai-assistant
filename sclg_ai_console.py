@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔═══════════════════════════════════════════════════════════╗
-║  Scoliologic AI Console (sclg-ai) v4.3.1                 ║
+║  Scoliologic AI Console (sclg-ai) v4.5.0                 ║
 ║  Autonomous DevOps/SysAdmin Agent                        ║
 ║  Execute first, explain later — like Claude Code          ║
 ║                                                           ║
@@ -83,7 +83,7 @@ SKILL_CLR   = C.rgb(120, 220, 200)
 
 # ── Configuration ───────────────────────────────────────────────────
 
-VERSION = "4.3.1"
+VERSION = "4.5.0"
 APP_NAME = "Scoliologic AI"
 
 GPU_BALANCER_URL = "http://10.0.0.229:11440"
@@ -174,7 +174,7 @@ KNOWN_HOSTS = _load_hosts()
 
 MODEL_PROFILES = {
     "code": {
-        "models": ["qwen2.5-coder-tools:32b", "qwen2.5-coder:14b", "qwen2.5-coder:7b"],
+        "models": ["sclg-coder:32b", "qwen2.5-coder-tools:32b", "qwen2.5-coder:14b", "qwen2.5-coder:7b"],
         "keywords": ["код", "code", "python", "bash", "script", "скрипт", "debug",
             "ошибка", "error", "bug", "функция", "function", "class", "def ",
             "import", "docker", "yaml", "json", "api", "http", "sql", "git",
@@ -183,33 +183,34 @@ MODEL_PROFILES = {
         "system_hint": "Ты опытный программист. Пиши чистый, рабочий код. Объясняй кратко.",
     },
     "sysadmin": {
-        "models": ["qwen3.5-27b-hf:latest", "mistral:7b", "qwen2.5:14b"],
+        "models": ["sclg-devops:27b", "qwen3.5-27b-hf:latest", "gemma4-26b-hf:latest", "phi4:14b", "qwen2.5:14b", "sclg-fast:7b", "mistral:7b"],
         "keywords": ["сервер", "server", "ssh", "network", "сеть", "firewall",
             "iptables", "dns", "ip", "ping", "traceroute", "диск", "disk",
             "memory", "cpu", "gpu", "nvidia", "процесс", "process",
             "kill", "systemctl", "service", "лог", "log", "порт", "port",
             "proxmox", "vm", "vpn", "ssl", "tls", "cert", "сканир", "scan",
             "почини", "исправь", "fix", "проверь", "status", "мониторинг",
-            "ollama", "роутер", "router", "mikrotik", "dhcp", "nat"],
+            "ollama", "роутер", "router", "mikrotik", "dhcp", "nat",
+            "мис", "mis", "медицинская информационная"],
         "temperature": 0.3,
         "system_hint": "Ты DevOps/SysAdmin эксперт. Выполняй команды и анализируй результаты.",
     },
     "analysis": {
-        "models": ["gemma4-26b-hf:latest", "phi4:14b", "qwen3.5-27b-hf:latest"],
+        "models": ["gemma4-26b-hf:latest", "glm-4.7-flash-hf:latest", "phi4:14b", "qwen3.5-27b-hf:latest", "sclg-general:14b"],
         "keywords": ["анализ", "analys", "data", "данные", "статистик",
             "медицин", "medical", "сколиоз", "исследован", "research"],
         "temperature": 0.3,
         "system_hint": "Ты аналитик данных. Давай структурированный анализ с выводами.",
     },
     "creative": {
-        "models": ["glm-4.7-flash-hf:latest", "gemma4-26b-hf:latest", "llama3.1:8b"],
+        "models": ["glm-4.7-flash-hf:latest", "gemma4-26b-hf:latest", "qwen3.5-27b-hf:latest", "llama3.1:8b"],
         "keywords": ["напиши", "write", "текст", "статья", "перевод",
             "резюме", "summary", "письмо", "email", "отчёт", "report"],
         "temperature": 0.7,
         "system_hint": "Ты писатель. Создавай грамотный, структурированный контент.",
     },
     "general": {
-        "models": ["qwen3.5-27b-hf:latest", "qwen2.5:14b", "llama3.1:8b"],
+        "models": ["sclg-general:14b", "gemma4-26b-hf:latest", "glm-4.7-flash-hf:latest", "qwen3.5-27b-hf:latest", "phi4:14b", "qwen2.5:14b", "sclg-fast:7b", "llama3.1:8b"],
         "keywords": [],
         "temperature": 0.5,
         "system_hint": "Ты универсальный AI-ассистент. Отвечай точно и полезно.",
@@ -441,12 +442,55 @@ class ResponseCleaner:
         "Следует отметить, что ": "",
     }
 
+    # LLM control tokens that must NEVER appear in output
+    TOXIC_TOKENS = [
+        "<|endoftext|>", "<|im_start|>", "<|im_end|>",
+        "<|assistant|>", "<|user|>", "<|system|>",
+        "<|end|>", "<|pad|>", "<s>", "</s>",
+        "[INST]", "[/INST]", "<<SYS>>", "<</SYS>>",
+    ]
+
+    # Regex for <think>...</think> blocks (DeepSeek, Qwen thinking tokens)
+    THINK_PATTERN = re.compile(r'<think>.*?</think>', re.DOTALL)
+    # Regex for leftover role markers from chat template leaks
+    ROLE_LEAK_PATTERN = re.compile(
+        r'(^|\n)(user|assistant|system)\s*\n',
+        re.IGNORECASE | re.MULTILINE
+    )
+    # Regex for repeated conversation fragments (model continues chat)
+    CONV_REPEAT_PATTERN = re.compile(
+        r'(\n|^)(Human|User|Assistant|Человек|Пользователь|Ассистент)\s*[:：]\s*',
+        re.IGNORECASE | re.MULTILINE
+    )
+
     def clean(self, text):
         """Apply all cleaning passes to response text."""
-        if not text or len(text) < 20:
+        if not text or len(text) < 5:
             return text
 
         result = text
+
+        # Pass 0a: Remove <think>...</think> blocks (DeepSeek/Qwen reasoning)
+        result = self.THINK_PATTERN.sub('', result)
+
+        # Pass 0b: Strip toxic LLM control tokens
+        for token in self.TOXIC_TOKENS:
+            result = result.replace(token, '')
+
+        # Pass 0c: Cut off response at conversation repeat
+        # If model starts generating "user: ..." it's hallucinating a conversation
+        match = self.CONV_REPEAT_PATTERN.search(result)
+        if match and match.start() > 50:  # Only if there's real content before it
+            result = result[:match.start()]
+
+        # Pass 0d: Remove role leak markers
+        result = self.ROLE_LEAK_PATTERN.sub('\n', result)
+
+        # Pass 0e: Collapse excessive newlines from removals
+        result = re.sub(r'\n{4,}', '\n\n\n', result)
+
+        if len(result.strip()) < 5:
+            return result.strip()
 
         # Pass 1: Strip chatbot openers
         for pat in self.CHATBOT_OPENERS:
@@ -468,6 +512,173 @@ class ResponseCleaner:
             )
 
         return result.strip()
+
+
+# ══════════════════════════════════════════════════════════════════════
+# OUTPUT FORMATTER — Claude Code style response rendering
+# Highlights IPs, draws tables, formats sections, colorizes output
+# ══════════════════════════════════════════════════════════════════════
+
+class OutputFormatter:
+    """Format AI responses in Claude Code style with colors, tables, sections."""
+
+    # Colors for different elements
+    IP_CLR      = C.rgb(100, 200, 255)   # Bright cyan for IPs
+    HEADER_CLR  = C.rgb(230, 100, 100)   # Red/accent for section headers
+    TABLE_CLR   = C.rgb(80, 80, 90)      # Dim for table borders
+    CODE_CLR    = C.rgb(180, 220, 140)   # Green for code/commands
+    KEY_CLR     = C.rgb(255, 180, 80)    # Orange for key names
+    VAL_CLR     = C.rgb(200, 200, 210)   # Light for values
+    OK_CLR      = C.rgb(120, 200, 120)   # Green for OK/success
+    ERR_CLR     = C.rgb(255, 80, 80)     # Red for errors
+    WARN_C      = C.rgb(255, 200, 60)    # Yellow for warnings
+    DIM_C       = C.rgb(100, 100, 110)   # Dim for less important
+    BOLD        = C.BOLD
+    RST         = C.RESET
+
+    # Regex patterns
+    IP_RE       = re.compile(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})(?:/(\d{1,2}))?\b')
+    MAC_RE      = re.compile(r'\b([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})\b')
+    SECTION_RE  = re.compile(r'^(={3,}|\u2550{3,})\s*(.+?)\s*(={3,}|\u2550{3,})\s*$', re.MULTILINE)
+    HEADER_RE   = re.compile(r'^(#{1,3})\s+(.+)$', re.MULTILINE)
+    BOLD_RE     = re.compile(r'\*\*(.+?)\*\*')
+    CODE_BLK_RE = re.compile(r'```(\w*)\n(.*?)```', re.DOTALL)
+    INLINE_CODE = re.compile(r'`([^`]+)`')
+    TABLE_RE    = re.compile(r'^\|(.+)\|\s*$', re.MULTILINE)
+    BULLET_RE   = re.compile(r'^(\s*)([-*•])\s+', re.MULTILINE)
+    STATUS_OK   = re.compile(r'\b(OK|UP|active|running|работает|активен|успешно)\b', re.IGNORECASE)
+    STATUS_ERR  = re.compile(r'\b(ERROR|FAIL|DOWN|CRITICAL|offline|ошибка|недоступен|упал)\b', re.IGNORECASE)
+    STATUS_WARN = re.compile(r'\b(WARNING|WARN|degraded|предупреждение|внимание)\b', re.IGNORECASE)
+
+    def format(self, text):
+        """Format response text with colors and structure."""
+        if not text or len(text) < 3:
+            return text
+
+        result = text
+
+        # Step 1: Process code blocks FIRST (protect from further formatting)
+        code_blocks = {}
+        counter = [0]
+        def save_code(m):
+            key = f"\x00CODE{counter[0]}\x00"
+            counter[0] += 1
+            lang = m.group(1) or ""
+            code = m.group(2)
+            # Format code block with border
+            lines = code.rstrip().split('\n')
+            formatted = []
+            hline = '\u2500' * max(0, 40 - len(lang))
+            formatted.append(f"{self.TABLE_CLR}\u250c\u2500 {lang} \u2500{hline}{self.RST}")
+            for line in lines:
+                # Highlight $ commands inside code blocks
+                if line.strip().startswith('$ '):
+                    formatted.append(f"{self.TABLE_CLR}│{self.RST} {self.CODE_CLR}{line}{self.RST}")
+                else:
+                    formatted.append(f"{self.TABLE_CLR}│{self.RST} {line}")
+            bline = '\u2500' * 44
+            formatted.append(f"{self.TABLE_CLR}\u2514{bline}{self.RST}")
+            code_blocks[key] = '\n'.join(formatted)
+            return key
+        result = self.CODE_BLK_RE.sub(save_code, result)
+
+        # Step 2: Format section headers (═══ Title ═══)
+        def fmt_section(m):
+            title = m.group(2).strip()
+            w = get_terminal_width() - 4
+            pad = max(0, w - len(title) - 6)
+            eline = '\u2550' * pad
+            return f"\n{self.HEADER_CLR}{self.BOLD}\u2550\u2550\u2550 {title} {eline}{self.RST}\n"
+        result = self.SECTION_RE.sub(fmt_section, result)
+
+        # Step 3: Format markdown headers (# Title)
+        def fmt_header(m):
+            level = len(m.group(1))
+            title = m.group(2).strip()
+            if level == 1:
+                return f"{self.HEADER_CLR}{self.BOLD}{title}{self.RST}"
+            elif level == 2:
+                return f"{self.KEY_CLR}{self.BOLD}{title}{self.RST}"
+            else:
+                return f"{self.KEY_CLR}{title}{self.RST}"
+        result = self.HEADER_RE.sub(fmt_header, result)
+
+        # Step 4: Format markdown tables
+        lines = result.split('\n')
+        formatted_lines = []
+        in_table = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith('|') and stripped.endswith('|'):
+                if not in_table:
+                    in_table = True
+                # Check if separator row
+                if re.match(r'^\|[\s:|-]+\|$', stripped):
+                    cells = [c.strip() for c in stripped.strip('|').split('|')]
+                    sep = f"{self.TABLE_CLR}├" + '┼'.join('─' * (len(c) + 2) for c in cells) + f"┤{self.RST}"
+                    formatted_lines.append(sep)
+                else:
+                    cells = [c.strip() for c in stripped.strip('|').split('|')]
+                    row_parts = []
+                    for cell in cells:
+                        # Colorize cell content
+                        cell = self._colorize_inline(cell)
+                        row_parts.append(f" {cell} ")
+                    formatted_lines.append(f"{self.TABLE_CLR}│{self.RST}" + f"{self.TABLE_CLR}│{self.RST}".join(row_parts) + f"{self.TABLE_CLR}│{self.RST}")
+            else:
+                if in_table:
+                    in_table = False
+                formatted_lines.append(line)
+        result = '\n'.join(formatted_lines)
+
+        # Step 5: Colorize IPs
+        def fmt_ip(m):
+            ip = m.group(1)
+            cidr = m.group(2)
+            if cidr:
+                return f"{self.IP_CLR}{ip}/{cidr}{self.RST}"
+            return f"{self.IP_CLR}{ip}{self.RST}"
+        result = self.IP_RE.sub(fmt_ip, result)
+
+        # Step 6: Colorize MAC addresses
+        def fmt_mac(m):
+            return f"{self.DIM_C}{m.group(1)}{self.RST}"
+        result = self.MAC_RE.sub(fmt_mac, result)
+
+        # Step 7: Bold text
+        def fmt_bold(m):
+            return f"{self.BOLD}{m.group(1)}{self.RST}"
+        result = self.BOLD_RE.sub(fmt_bold, result)
+
+        # Step 8: Inline code
+        def fmt_inline(m):
+            return f"{self.CODE_CLR}{m.group(1)}{self.RST}"
+        result = self.INLINE_CODE.sub(fmt_inline, result)
+
+        # Step 9: Bullet points
+        def fmt_bullet(m):
+            indent = m.group(1)
+            return f"{indent}{self.KEY_CLR}•{self.RST} "
+        result = self.BULLET_RE.sub(fmt_bullet, result)
+
+        # Step 10: Status words
+        result = self.STATUS_OK.sub(lambda m: f"{self.OK_CLR}{m.group()}{self.RST}", result)
+        result = self.STATUS_ERR.sub(lambda m: f"{self.ERR_CLR}{m.group()}{self.RST}", result)
+        result = self.STATUS_WARN.sub(lambda m: f"{self.WARN_C}{m.group()}{self.RST}", result)
+
+        # Step 11: Restore code blocks
+        for key, block in code_blocks.items():
+            result = result.replace(key, block)
+
+        return result
+
+    def _colorize_inline(self, text):
+        """Colorize inline content (IPs, status words) within table cells."""
+        text = self.IP_RE.sub(lambda m: f"{self.IP_CLR}{m.group()}{self.RST}", text)
+        text = self.STATUS_OK.sub(lambda m: f"{self.OK_CLR}{m.group()}{self.RST}", text)
+        text = self.STATUS_ERR.sub(lambda m: f"{self.ERR_CLR}{m.group()}{self.RST}", text)
+        text = self.STATUS_WARN.sub(lambda m: f"{self.WARN_C}{m.group()}{self.RST}", text)
+        return text
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -709,10 +920,12 @@ def draw_hline(char="─", color=BORDER_CLR):
 def draw_dashed():
     print(f"{BORDER_CLR}{'┄' * get_terminal_width()}{C.RESET}")
 
-CLAW_MINI = """  ╱▔╲ ╱▔╲
- ( ◉   ◉ )
-  ╲▁▁▁▁▁╱
-   ╱╲ ╱╲"""
+CLAW_MINI = """     █▀▄    ▄▀█
+     ██ ▀▀▀▀ ██
+     ██ ●  ● ██
+     ▀█ ▀██▀ █▀
+      ▀▄▄▄▄▄▄▀
+        ▀▀▀▀"""
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -873,7 +1086,7 @@ class OllamaClient:
         # Return first available
         return available[0] if available else None
 
-    def generate(self, model, prompt, system="", temperature=0.5, max_tokens=4096, stream=False, retries=2):
+    def generate(self, model, prompt, system="", temperature=0.5, max_tokens=2048, stream=False, retries=2):
         """Generate response from Ollama with retry logic."""
         payload = {
             "model": model,
@@ -883,6 +1096,9 @@ class OllamaClient:
             "options": {
                 "temperature": temperature,
                 "num_predict": max_tokens,
+                "stop": ["<|endoftext|>", "<|im_start|>", "<|im_end|>",
+                         "<|end|>", "</s>", "<|assistant|>", "<|user|>",
+                         "\nUser:", "\nuser:", "\nHuman:", "\nПользователь:"],
             }
         }
 
@@ -911,12 +1127,19 @@ class OllamaClient:
 
         return f"[ERROR] Ollama failed after {retries} attempts: {last_error}"
 
-    def chat(self, model, messages, system="", temperature=0.5, max_tokens=4096, stream=False, retries=2):
+    def chat(self, model, messages, system="", temperature=0.5, max_tokens=2048, stream=False, retries=2):
         """Chat completion from Ollama with retry logic."""
         msgs = []
         if system:
             msgs.append({"role": "system", "content": system})
         msgs.extend(messages)
+
+        # Limit context to prevent models from seeing too much history
+        # and generating conversation continuations
+        if len(msgs) > 8:
+            system_msgs = [m for m in msgs if m.get('role') == 'system']
+            other_msgs = [m for m in msgs if m.get('role') != 'system']
+            msgs = system_msgs + other_msgs[-6:]
 
         payload = {
             "model": model,
@@ -925,6 +1148,9 @@ class OllamaClient:
             "options": {
                 "temperature": temperature,
                 "num_predict": max_tokens,
+                "stop": ["<|endoftext|>", "<|im_start|>", "<|im_end|>",
+                         "<|end|>", "</s>", "<|assistant|>", "<|user|>",
+                         "\nUser:", "\nuser:", "\nHuman:", "\nПользователь:"],
             }
         }
 
@@ -1664,6 +1890,7 @@ class SclgAI:
         self.stats = StatsTracker()
         self.training = TrainingCollector()
         self.learner = InfraLearnerBridge()
+        self.formatter = OutputFormatter()
 
         # State
         self.conversation = []
@@ -1753,6 +1980,15 @@ class SclgAI:
 5. Используй русский язык по умолчанию.
 6. Не начинай ответ с "Конечно!" или "Безусловно!".
 7. Не заканчивай "Если нужно что-то ещё — обращайтесь!".
+8. НИКОГДА не генерируй токены <think>, <|endoftext|>, <|im_start|> и подобные.
+9. Не продолжай разговор от лица пользователя. Отвечай ТОЛЬКО на текущий вопрос.
+
+ФОРМАТ ОТВЕТА (очень важно!):
+- Для системных данных используй таблицы (колонки через |)
+- Группируй данные по секциям с заголовками (например: "═══ Сеть ═══", "═══ DNS ═══")
+- IP-адреса выделяй как есть, не маскируй
+- В конце дай краткий вывод или рекомендацию
+- Не копируй сырые данные — АНАЛИЗИРУЙ и структурируй
 
 ИНФРАСТРУКТУРА:
 - GPU Balancer: {GPU_BALANCER_URL}
@@ -1979,7 +2215,7 @@ class SclgAI:
                     # First model failed — try a smaller/faster model
                     if spinner:
                         spinner.update(f"{model_short} failed, trying fallback...")
-                    fallback_models = ["qwen2.5:7b", "gemma2:9b", "llama3.1:8b", "phi3:mini"]
+                    fallback_models = ["sclg-fast:7b", "qwen2.5:7b", "phi4:14b", "llama3.1:8b", "mistral:7b"]
                     fallback_model = self.ollama.find_best_model(fallback_models)
                     if fallback_model and fallback_model != model:
                         fb_short = fallback_model.split(":")[0] if ":" in fallback_model else fallback_model
@@ -2004,7 +2240,7 @@ class SclgAI:
 
         # Last resort: if we have data_context, format it nicely
         if data_context:
-            return f"Результаты выполненных команд:\n\n{data_context}\n\n{C.DIM}(АИ недоступен для анализа — показаны сырые данные){C.RESET}"
+            return f"Результаты выполненных команд:\n\n{data_context}\n\n{DIM_COLOR}(АИ недоступен для анализа — показаны сырые данные){C.RESET}"
 
         return "[ERROR] No AI models available. Check GPU Balancer and Claude API."
 
@@ -2028,7 +2264,7 @@ class SclgAI:
             header = "Информация о GPU"
 
         lines = []
-        lines.append(f"\n{ACCENT1}━━━ {header} ━━━{C.RESET}\n")
+        lines.append(f"\n{ACCENT}━━━ {header} ━━━{C.RESET}\n")
         # Parse sections from data_context
         for line in data_context.split('\n'):
             if line.startswith('$ '):
@@ -2292,7 +2528,8 @@ class SclgAI:
         response = self._claude_fallback(query)
         claude_sp.stop("Claude responded")
         response = self.cleaner.clean(response)
-        print(f"\n{AI_COLOR}{response}{C.RESET}")
+        formatted = self.formatter.format(response)
+        print(f"\n{formatted}{C.RESET}")
 
     def _show_knowledge(self, query=""):
         """Show learned infrastructure knowledge."""
@@ -2374,34 +2611,214 @@ class SclgAI:
 
     # ── Banner ──────────────────────────────────────────────────────────────
 
+    def _get_dynamic_data(self):
+        """Collect dynamic system data for banner."""
+        data = {}
+        try:
+            # Uptime
+            r = subprocess.run("uptime", capture_output=True, text=True, timeout=3)
+            data["uptime"] = r.stdout.strip() if r.returncode == 0 else "unknown"
+        except Exception:
+            data["uptime"] = "unknown"
+        try:
+            # Memory
+            r = subprocess.run(["python3", "-c",
+                "import os; s=os.sysconf; pages=s('SC_PHYS_PAGES'); sz=s('SC_PAGE_SIZE'); total=pages*sz/1024**3; print(f'{total:.1f}GB')"],
+                capture_output=True, text=True, timeout=3)
+            data["memory"] = r.stdout.strip() if r.returncode == 0 else "?"
+        except Exception:
+            try:
+                r = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=3)
+                if r.returncode == 0:
+                    gb = int(r.stdout.strip()) / (1024**3)
+                    data["memory"] = f"{gb:.0f}GB"
+                else:
+                    data["memory"] = "?"
+            except Exception:
+                data["memory"] = "?"
+        try:
+            # CPU
+            r = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"], capture_output=True, text=True, timeout=3)
+            if r.returncode == 0:
+                data["cpu"] = r.stdout.strip()
+            else:
+                r = subprocess.run(["uname", "-m"], capture_output=True, text=True, timeout=3)
+                data["cpu"] = r.stdout.strip()
+        except Exception:
+            data["cpu"] = "unknown"
+        try:
+            # Disk
+            r = subprocess.run(["df", "-h", "/"], capture_output=True, text=True, timeout=3)
+            if r.returncode == 0:
+                lines = r.stdout.strip().split("\n")
+                if len(lines) >= 2:
+                    parts = lines[1].split()
+                    data["disk"] = f"{parts[2]}/{parts[1]} ({parts[4]})"
+                else:
+                    data["disk"] = "?"
+            else:
+                data["disk"] = "?"
+        except Exception:
+            data["disk"] = "?"
+        try:
+            # Hostname
+            r = subprocess.run("hostname", capture_output=True, text=True, timeout=3)
+            data["hostname"] = r.stdout.strip()
+        except Exception:
+            data["hostname"] = "unknown"
+        try:
+            # macOS version
+            r = subprocess.run(["sw_vers", "-productVersion"], capture_output=True, text=True, timeout=3)
+            data["os_ver"] = f"macOS {r.stdout.strip()}" if r.returncode == 0 else "macOS"
+        except Exception:
+            data["os_ver"] = "Linux"
+        # GPU metrics from Grafana (quick)
+        try:
+            if GRAFANA_TOKEN:
+                import urllib.request
+                query = 'nvidia_smi_temperature_gpu'
+                url = f"{GRAFANA_URL}/api/datasources/proxy/uid/{PROMETHEUS_DS_UID}/api/v1/query?query={query}"
+                req = urllib.request.Request(url, headers={"Authorization": f"Bearer {GRAFANA_TOKEN}"})
+                ctx = _ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = _ssl.CERT_NONE
+                with urllib.request.urlopen(req, timeout=3, context=ctx) as resp:
+                    result = json.loads(resp.read().decode())
+                    gpus = result.get("data", {}).get("result", [])
+                    if gpus:
+                        temps = [f"{g.get('metric', {}).get('gpu', '?')}:{g['value'][1]}°C" for g in gpus]
+                        data["gpu_temp"] = ", ".join(temps[:4])
+                    else:
+                        data["gpu_temp"] = None
+            else:
+                data["gpu_temp"] = None
+        except Exception:
+            data["gpu_temp"] = None
+        # InfraLearner stats
+        try:
+            stats = self.learner.get_learner_status()
+            data["learner_cycles"] = stats.get("total_cycles", 0)
+            data["learner_insights"] = stats.get("total_insights_generated", 0)
+        except Exception:
+            data["learner_cycles"] = 0
+            data["learner_insights"] = 0
+        # Anomalies count
+        try:
+            anomalies = self.learner.get_anomalies(hours=24)
+            data["anomaly_count"] = len(anomalies) if anomalies else 0
+        except Exception:
+            data["anomaly_count"] = 0
+        return data
+
     def show_banner(self):
-        """Show startup banner."""
+        """Show startup banner in Claude Code style with two-column table."""
         w = get_terminal_width()
         clear_screen()
 
-        # Title
-        title = f"Scoliologic AI v{VERSION}"
-        title_line = f"┤ {title} ├"
+        # ── Title bar ──
+        title = f" Scoliologic AI v{VERSION} "
+        title_line = f"┤{title}├"
         pad = (w - len(title_line)) // 2
         print(f"{ACCENT}{'─' * pad}{title_line}{'─' * (w - pad - len(title_line))}{C.RESET}")
+        print()
 
-        # Logo + info
-        print(f"""
-{LOGO_CLR}{CLAW_MINI}{C.RESET}
-  {C.BOLD}Welcome back ilea{C.RESET}         {ACCENT}DevOps Agent{C.RESET}
-                              {SYSTEM_CLR}⚡ Execute & fix systems{C.RESET}
-                              {NET_CLR}● Scan networks & ports{C.RESET}
-                              {TOOL_CLR}✎ SSH to any host/router{C.RESET}
-                              {CLAUDE_CLR}🧠 MoE expert routing{C.RESET}
-                              {MEMORY_CLR}💭 Dream memory{C.RESET}
-                              {SKILL_CLR}📊 InfraLearner (self-learning){C.RESET}
-""")
+        # ── Two-column table like Claude Code ──
+        # Left column: logo + identity, Right column: dynamic data
+        col_w = (w - 3) // 2  # -3 for border chars
+        if col_w < 30:
+            col_w = 40
+
+        # Collect dynamic data
+        dyn = self._get_dynamic_data()
+
+        # Build left column lines
+        logo_lines = CLAW_MINI.strip().split("\n")
+        left = []
+        for line in logo_lines:
+            left.append(f"{LOGO_CLR}{line}{C.RESET}")
+        left.append(f"")
+        left.append(f"{C.BOLD}Welcome back ilea{C.RESET}")
+        left.append(f"")
+
+        # Model info
+        if self.claude_ok:
+            claude_str = f"{CLAUDE_CLR}Sonnet 4{C.RESET} · API Usage Billing"
+        else:
+            claude_str = f"{WARN_CLR}Claude offline{C.RESET}"
+        left.append(claude_str)
+        left.append(f"{DIM_COLOR}ilea's Individual Org{C.RESET}")
+        left.append(f"{DIM_COLOR}~/{dyn.get('hostname', 'Mac-mini')}{C.RESET}")
+
+        # Build right column lines
+        right = []
+        right.append(f"{ACCENT}System Info{C.RESET}")
+        right.append(f"{DIM_COLOR}{dyn.get('os_ver', 'macOS')} · {dyn.get('cpu', 'ARM')}{C.RESET}")
+        right.append(f"{DIM_COLOR}Memory: {dyn.get('memory', '?')} · Disk: {dyn.get('disk', '?')}{C.RESET}")
+        right.append(f"")
+        right.append(f"{SYSTEM_CLR}Infrastructure{C.RESET}")
+        right.append(f"{DIM_COLOR}GPU Balancer: {self.model_count} models{C.RESET}")
+        if dyn.get("gpu_temp"):
+            right.append(f"{DIM_COLOR}GPU Temp: {dyn['gpu_temp']}{C.RESET}")
+        if dyn["learner_cycles"] > 0:
+            right.append(f"{SKILL_CLR}InfraLearner: {dyn['learner_cycles']} cycles, {dyn['learner_insights']} insights{C.RESET}")
+        else:
+            right.append(f"{DIM_COLOR}InfraLearner: idle{C.RESET}")
+        if dyn["anomaly_count"] > 0:
+            right.append(f"{WARN_CLR}⚠ {dyn['anomaly_count']} anomalies (24h){C.RESET}")
+        else:
+            right.append(f"{SYSTEM_CLR}✓ No anomalies (24h){C.RESET}")
+        right.append(f"")
+        right.append(f"{ACCENT2}Recent activity{C.RESET}")
+        # Show last few commands from history
+        try:
+            if os.path.exists(HISTORY_FILE):
+                with open(HISTORY_FILE) as f:
+                    hist = [l.strip() for l in f.readlines() if l.strip()][-3:]
+                if hist:
+                    for h in hist:
+                        right.append(f"{DIM_COLOR}› {h[:col_w-4]}{C.RESET}")
+                else:
+                    right.append(f"{DIM_COLOR}No recent activity{C.RESET}")
+            else:
+                right.append(f"{DIM_COLOR}No recent activity{C.RESET}")
+        except Exception:
+            right.append(f"{DIM_COLOR}No recent activity{C.RESET}")
+
+        # Pad columns to same length
+        max_lines = max(len(left), len(right))
+        while len(left) < max_lines:
+            left.append("")
+        while len(right) < max_lines:
+            right.append("")
+
+        # Helper to get visible length (strip ANSI)
+        import re
+        def vis_len(s):
+            return len(re.sub(r'\033\[[^m]*m', '', s))
+
+        # Draw top border
+        print(f"{BORDER_CLR}┌{'─' * (col_w)}┬{'─' * (col_w)}┐{C.RESET}")
+
+        # Draw rows
+        for i in range(max_lines):
+            l = left[i]
+            r = right[i]
+            l_vis = vis_len(l)
+            r_vis = vis_len(r)
+            l_pad = max(0, col_w - 2 - l_vis)
+            r_pad = max(0, col_w - 2 - r_vis)
+            print(f"{BORDER_CLR}│{C.RESET} {l}{' ' * l_pad}{BORDER_CLR}│{C.RESET} {r}{' ' * r_pad}{BORDER_CLR}│{C.RESET}")
+
+        # Draw bottom border
+        print(f"{BORDER_CLR}└{'─' * (col_w)}┴{'─' * (col_w)}┘{C.RESET}")
+        print()
 
     def show_status(self):
-        """Show connection status line."""
+        """Show connection status line with dynamic data."""
         networks = self.scanner.get_local_networks()
         net_str = ", ".join(f"{ip}/24" for ip in networks[:2]) if networks else "unknown"
 
+        # Status badges
         parts = []
         if self.ollama_ok:
             parts.append(f"{SYSTEM_CLR}Connected{C.RESET}")
@@ -2460,8 +2877,9 @@ class SclgAI:
 
                 elapsed = time.time() - start_time
 
-                # Display response
-                print(f"\n{AI_COLOR}{response}{C.RESET}")
+                # Display response (formatted like Claude Code)
+                formatted = self.formatter.format(response)
+                print(f"\n{formatted}{C.RESET}")
 
                 # Show metadata
                 model_str = self.current_model or "?"
@@ -2473,9 +2891,10 @@ class SclgAI:
                 # Signal InfraLearner it can resume
                 self.learner.signal_user_idle()
 
-                # Update conversation
+                # Update conversation (store CLEANED response to prevent token leak propagation)
+                clean_response = self.cleaner.clean(response)
                 self.conversation.append({"role": "user", "content": user_input})
-                self.conversation.append({"role": "assistant", "content": response[:2000]})
+                self.conversation.append({"role": "assistant", "content": clean_response[:2000]})
 
                 # Keep conversation manageable
                 if len(self.conversation) > 20:
