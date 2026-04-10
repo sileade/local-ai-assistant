@@ -1321,7 +1321,7 @@ class ClaudeClient:
         return max(0, CLAUDE_MONTHLY_LIMIT - self.usage.get("monthly_count", 0))
 
     def chat(self, messages, system="", max_tokens=CLAUDE_MAX_TOKENS, temperature=0.3):
-        """Send request to Claude API."""
+        """Send request to Claude API with retry for 429/529 (overloaded/rate-limited)."""
         if not self.can_use():
             return "[BUDGET] Claude daily/monthly limit reached"
 
@@ -1341,36 +1341,60 @@ class ClaudeClient:
             payload["system"] = system
 
         data = json.dumps(payload).encode()
-        req = urllib.request.Request(
-            CLAUDE_API_URL,
-            data=data,
-            headers=headers,
-            method="POST"
-        )
 
-        try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                result = json.loads(resp.read().decode())
-                content = ""
-                for block in result.get("content", []):
-                    if block.get("type") == "text":
-                        content += block.get("text", "")
+        # Retry logic: up to 3 attempts with exponential backoff for 429/529
+        max_retries = 3
+        last_error = None
 
-                # Track usage
-                usage = result.get("usage", {})
-                self.usage["daily_count"] = self.usage.get("daily_count", 0) + 1
-                self.usage["monthly_count"] = self.usage.get("monthly_count", 0) + 1
-                self.usage["total_tokens"] = self.usage.get("total_tokens", 0) + \
-                    usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
-                self._save_usage()
+        for attempt in range(max_retries):
+            try:
+                req = urllib.request.Request(
+                    CLAUDE_API_URL,
+                    data=data,
+                    headers=headers,
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=45) as resp:
+                    result = json.loads(resp.read().decode())
+                    content = ""
+                    for block in result.get("content", []):
+                        if block.get("type") == "text":
+                            content += block.get("text", "")
 
-                return content
+                    # Track usage
+                    usage = result.get("usage", {})
+                    self.usage["daily_count"] = self.usage.get("daily_count", 0) + 1
+                    self.usage["monthly_count"] = self.usage.get("monthly_count", 0) + 1
+                    self.usage["total_tokens"] = self.usage.get("total_tokens", 0) + \
+                        usage.get("input_tokens", 0) + usage.get("output_tokens", 0)
+                    self._save_usage()
 
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode() if hasattr(e, 'read') else str(e)
-            return f"[ERROR] Claude API {e.code}: {error_body[:200]}"
-        except Exception as e:
-            return f"[ERROR] Claude: {e}"
+                    return content
+
+            except urllib.error.HTTPError as e:
+                error_body = ""
+                try:
+                    error_body = e.read().decode()
+                except Exception:
+                    error_body = str(e)
+                last_error = f"Claude API {e.code}: {error_body[:200]}"
+
+                # Retry on 429 (rate limit) and 529 (overloaded)
+                if e.code in (429, 529, 503, 500) and attempt < max_retries - 1:
+                    wait_time = (attempt + 1) * 5  # 5s, 10s, 15s
+                    time.sleep(wait_time)
+                    continue
+                else:
+                    return f"[ERROR] {last_error}"
+
+            except Exception as e:
+                last_error = str(e)
+                if attempt < max_retries - 1:
+                    time.sleep(3)
+                    continue
+                return f"[ERROR] Claude: {last_error}"
+
+        return f"[ERROR] Claude failed after {max_retries} retries: {last_error}"
 
     def test_connection(self):
         """Quick test if Claude API is reachable."""
@@ -2189,7 +2213,11 @@ class SclgAI:
                     response = self._claude_fallback(query, data_context, expert)
                 finally:
                     claude_spinner.stop(f"Claude responded")
-                self.stats.record(expert, "claude", used_claude=True)
+                # If Claude also failed (529/overloaded), fall back to raw data
+                if response.startswith("[ERROR]") and data_context:
+                    response = self._format_raw_data(query, data_context)
+                else:
+                    self.stats.record(expert, "claude", used_claude=True)
             else:
                 # No Claude available — format data nicely as fallback
                 if data_context:
@@ -2317,11 +2345,17 @@ class SclgAI:
         if self.claude_ok and self.claude.can_use():
             if spinner:
                 spinner.update("Claude fallback")
-            return self._claude_fallback(query, data_context, expert)
+            claude_response = self._claude_fallback(query, data_context, expert)
+            # If Claude also failed (529/overloaded), don't return error — try raw data
+            if claude_response and not claude_response.startswith("[ERROR]"):
+                return claude_response
+            else:
+                if spinner:
+                    spinner.update("Claude unavailable, formatting data...")
 
         # Last resort: if we have data_context, format it nicely
         if data_context:
-            return f"Результаты выполненных команд:\n\n{data_context}\n\n{DIM_COLOR}(АИ недоступен для анализа — показаны сырые данные){C.RESET}"
+            return self._format_raw_data(query, data_context)
 
         return "[ERROR] No AI models available. Check GPU Balancer and Claude API."
 
