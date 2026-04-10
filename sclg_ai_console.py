@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔═══════════════════════════════════════════════════════════╗
-║  Scoliologic AI Console (sclg-ai) v4.1.0                 ║
+║  Scoliologic AI Console (sclg-ai) v4.2.0                 ║
 ║  Autonomous DevOps/SysAdmin Agent                        ║
 ║  Execute first, explain later — like Claude Code          ║
 ║                                                           ║
@@ -80,7 +80,7 @@ SKILL_CLR   = C.rgb(120, 220, 200)
 
 # ── Configuration ───────────────────────────────────────────────────
 
-VERSION = "4.1.0"
+VERSION = "4.2.0"
 APP_NAME = "Scoliologic AI"
 
 GPU_BALANCER_URL = "http://10.0.0.229:11440"
@@ -664,13 +664,119 @@ CLAW_MINI = """  ╱▔╲ ╱▔╲
 
 
 # ══════════════════════════════════════════════════════════════════════
+# ANIMATED SPINNER — Visual feedback while AI is thinking
+# Shows braille animation + elapsed time + current action
+# ══════════════════════════════════════════════════════════════════════
+
+class Spinner:
+    """Animated spinner with timer for long-running operations."""
+
+    BRAILLE = ["⣾", "⣽", "⣻", "⢿", "⣿", "⣟", "⣯", "⣷"]
+    DOTS    = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+    def __init__(self, message="Thinking", color=ACCENT2, style="braille"):
+        self.message = message
+        self.color = color
+        self.frames = self.BRAILLE if style == "braille" else self.DOTS
+        self._running = False
+        self._thread = None
+        self._start_time = 0
+        self._substatus = ""
+        self._lock = threading.Lock()
+
+    def _animate(self):
+        """Animation loop running in background thread."""
+        idx = 0
+        while self._running:
+            elapsed = time.time() - self._start_time
+            frame = self.frames[idx % len(self.frames)]
+            with self._lock:
+                sub = self._substatus
+
+            # Build status line
+            status = f"\r  {self.color}{frame} {self.message}... {elapsed:.0f}s{C.RESET}"
+            if sub:
+                status += f"  {DIM_COLOR}{sub}{C.RESET}"
+
+            # Pad to clear previous line
+            status += " " * 20
+
+            sys.stdout.write(status)
+            sys.stdout.flush()
+            idx += 1
+            time.sleep(0.12)
+
+    def update(self, substatus):
+        """Update substatus text (e.g., model name, step)."""
+        with self._lock:
+            self._substatus = substatus
+
+    def start(self):
+        """Start the spinner."""
+        self._running = True
+        self._start_time = time.time()
+        self._thread = threading.Thread(target=self._animate, daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self, final_message=""):
+        """Stop the spinner and clear the line."""
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=1)
+        elapsed = time.time() - self._start_time
+        # Clear spinner line
+        sys.stdout.write(f"\r{' ' * (get_terminal_width())}\r")
+        sys.stdout.flush()
+        if final_message:
+            print(f"  {SYSTEM_CLR}{final_message} ({elapsed:.1f}s){C.RESET}")
+
+    def __enter__(self):
+        return self.start()
+
+    def __exit__(self, *args):
+        self.stop()
+
+
+class ProgressBar:
+    """Simple progress indicator for multi-step operations."""
+
+    def __init__(self, total, label="Progress", color=TOOL_CLR):
+        self.total = total
+        self.current = 0
+        self.label = label
+        self.color = color
+
+    def update(self, step_name=""):
+        """Update progress."""
+        self.current += 1
+        pct = int(self.current / self.total * 100) if self.total > 0 else 0
+        bar_width = 20
+        filled = int(bar_width * self.current / self.total) if self.total > 0 else 0
+        bar = "█" * filled + "░" * (bar_width - filled)
+        status = f"\r  {self.color}{self.label} [{bar}] {pct}%{C.RESET}"
+        if step_name:
+            status += f"  {DIM_COLOR}{step_name}{C.RESET}"
+        status += " " * 10
+        sys.stdout.write(status)
+        sys.stdout.flush()
+
+    def finish(self, message=""):
+        """Complete the progress bar."""
+        sys.stdout.write(f"\r{' ' * get_terminal_width()}\r")
+        sys.stdout.flush()
+        if message:
+            print(f"  {SYSTEM_CLR}✓ {message}{C.RESET}")
+
+
+# ══════════════════════════════════════════════════════════════════════
 # OLLAMA CLIENT — Connects to GPU Balancer or direct nodes
 # ══════════════════════════════════════════════════════════════════════
 
 class OllamaClient:
     """Client for Ollama API with GPU Balancer support."""
 
-    def __init__(self, base_url=GPU_BALANCER_URL, timeout=120):
+    def __init__(self, base_url=GPU_BALANCER_URL, timeout=180):
         self.base_url = base_url
         self.timeout = timeout
         self.available_models = []
@@ -715,8 +821,8 @@ class OllamaClient:
         # Return first available
         return available[0] if available else None
 
-    def generate(self, model, prompt, system="", temperature=0.5, max_tokens=4096, stream=False):
-        """Generate response from Ollama."""
+    def generate(self, model, prompt, system="", temperature=0.5, max_tokens=4096, stream=False, retries=2):
+        """Generate response from Ollama with retry logic."""
         payload = {
             "model": model,
             "prompt": prompt,
@@ -729,24 +835,32 @@ class OllamaClient:
         }
 
         data = json.dumps(payload).encode()
-        req = urllib.request.Request(
-            f"{self.base_url}/api/generate",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
+        last_error = None
 
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                result = json.loads(resp.read().decode())
-                return result.get("response", "")
-        except urllib.error.URLError as e:
-            return f"[ERROR] Ollama connection failed: {e}"
-        except Exception as e:
-            return f"[ERROR] Ollama error: {e}"
+        for attempt in range(retries):
+            try:
+                req = urllib.request.Request(
+                    f"{self.base_url}/api/generate",
+                    data=data,
+                    headers={"Content-Type": "application/json"},
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    result = json.loads(resp.read().decode())
+                    return result.get("response", "")
+            except urllib.error.URLError as e:
+                last_error = e
+                if attempt < retries - 1:
+                    time.sleep(2)
+            except Exception as e:
+                last_error = e
+                if attempt < retries - 1:
+                    time.sleep(2)
 
-    def chat(self, model, messages, system="", temperature=0.5, max_tokens=4096, stream=False):
-        """Chat completion from Ollama."""
+        return f"[ERROR] Ollama failed after {retries} attempts: {last_error}"
+
+    def chat(self, model, messages, system="", temperature=0.5, max_tokens=4096, stream=False, retries=2):
+        """Chat completion from Ollama with retry logic."""
         msgs = []
         if system:
             msgs.append({"role": "system", "content": system})
@@ -763,21 +877,29 @@ class OllamaClient:
         }
 
         data = json.dumps(payload).encode()
-        req = urllib.request.Request(
-            f"{self.base_url}/api/chat",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
+        last_error = None
 
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                result = json.loads(resp.read().decode())
-                return result.get("message", {}).get("content", "")
-        except urllib.error.URLError as e:
-            return f"[ERROR] Ollama chat failed: {e}"
-        except Exception as e:
-            return f"[ERROR] Ollama chat error: {e}"
+        for attempt in range(retries):
+            try:
+                req = urllib.request.Request(
+                    f"{self.base_url}/api/chat",
+                    data=data,
+                    headers={"Content-Type": "application/json"},
+                    method="POST"
+                )
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    result = json.loads(resp.read().decode())
+                    return result.get("message", {}).get("content", "")
+            except urllib.error.URLError as e:
+                last_error = e
+                if attempt < retries - 1:
+                    time.sleep(2)
+            except Exception as e:
+                last_error = e
+                if attempt < retries - 1:
+                    time.sleep(2)
+
+        return f"[ERROR] Ollama chat failed after {retries} attempts: {last_error}"
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1108,24 +1230,33 @@ class SmartExecutor:
         ]
 
     def execute(self, commands, timeout=30):
-        """Execute commands and collect results."""
+        """Execute commands and collect results with progress indication."""
         results = []
-        for cmd in commands:
+        total = len(commands)
+        progress = ProgressBar(total, label="Collecting data", color=TOOL_CLR)
+
+        for i, cmd in enumerate(commands):
+            cmd_short = cmd.split('|')[0].strip()[:50]
+            progress.update(cmd_short)
+
             try:
+                t0 = time.time()
                 proc = subprocess.run(
                     cmd, shell=True, capture_output=True, text=True,
                     timeout=timeout
                 )
+                dt = time.time() - t0
                 output = proc.stdout.strip()
                 if proc.stderr.strip() and not output:
                     output = proc.stderr.strip()
                 if output:
-                    results.append(f"$ {cmd.split('|')[0].strip()[:60]}...\n{output}")
+                    results.append(f"$ {cmd_short}...\n{output}")
             except subprocess.TimeoutExpired:
                 results.append(f"$ {cmd[:40]}... [TIMEOUT after {timeout}s]")
             except Exception as e:
                 results.append(f"$ {cmd[:40]}... [ERROR: {e}]")
 
+        progress.finish(f"Collected {len(results)}/{total} data sources")
         return "\n\n".join(results) if results else ""
 
     def is_sysadmin_query(self, query):
@@ -1332,24 +1463,28 @@ class SclgAI:
     # ── Connection Check ────────────────────────────────────────────
 
     def check_connections(self):
-        """Check all connections on startup."""
+        """Check all connections on startup with animated feedback."""
         # Check Ollama/GPU Balancer
-        print(f"  {DIM_COLOR}Checking GPU Balancer...{C.RESET}", end="", flush=True)
+        spinner = Spinner("Connecting to GPU Balancer", color=TOOL_CLR, style="dots")
+        spinner.start()
         self.ollama_ok = self.ollama.check_connection()
         if self.ollama_ok:
             self.model_count = len(self.ollama.available_models)
-            print(f"\r  {SYSTEM_CLR}✓ GPU Balancer: {self.model_count} models{C.RESET}")
+            spinner.stop(f"✓ GPU Balancer: {self.model_count} models")
         else:
-            print(f"\r  {ERROR_CLR}✗ GPU Balancer offline{C.RESET}")
+            spinner.stop()
+            print(f"  {ERROR_CLR}✗ GPU Balancer offline{C.RESET}")
 
         # Check Claude
-        print(f"  {DIM_COLOR}Checking Claude API...{C.RESET}", end="", flush=True)
+        spinner2 = Spinner("Checking Claude API", color=CLAUDE_CLR, style="dots")
+        spinner2.start()
         self.claude_ok = self.claude.test_connection()
         if self.claude_ok:
             remaining = self.claude.remaining_today()
-            print(f"\r  {CLAUDE_CLR}✓ Claude OK ({remaining}/{CLAUDE_DAILY_LIMIT} today){C.RESET}")
+            spinner2.stop(f"✓ Claude OK ({remaining}/{CLAUDE_DAILY_LIMIT} today)")
         else:
-            print(f"\r  {WARN_CLR}⚠ Claude unavailable{C.RESET}")
+            spinner2.stop()
+            print(f"  {WARN_CLR}⚠ Claude unavailable{C.RESET}")
 
     # ── System Prompt Builder ───────────────────────────────────────
 
@@ -1423,7 +1558,7 @@ class SclgAI:
         data_context = ""
         commands, category = self.executor.match(query)
         if commands:
-            print(f"  {TOOL_CLR}⚡ Executing commands...{C.RESET}")
+            print(f"  {TOOL_CLR}⚡ Collecting system data...{C.RESET}")
             data_context = self.executor.execute(commands)
             if category:
                 expert = category
@@ -1437,8 +1572,13 @@ class SclgAI:
             ]
             data_context = self.executor.execute(generic_cmds)
 
-        # Step 5: Get AI response
-        response = self._get_ai_response(query, expert, data_context)
+        # Step 5: Get AI response (with spinner)
+        spinner = Spinner("Analyzing", color=ACCENT2)
+        spinner.start()
+        try:
+            response = self._get_ai_response(query, expert, data_context, spinner=spinner)
+        finally:
+            spinner.stop()
 
         # Step 6: Quality check
         is_good, reason = self.quality.check(response, query)
@@ -1446,8 +1586,12 @@ class SclgAI:
         if not is_good and reason in ("refusal", "no_data_for_sys_query"):
             # Model refused or gave generic advice — try Claude
             if self.claude_ok and self.claude.can_use():
-                print(f"  {CLAUDE_CLR}⟳ Local model refused → Claude fallback{C.RESET}")
-                response = self._claude_fallback(query, data_context, expert)
+                claude_spinner = Spinner("Claude re-analyzing", color=CLAUDE_CLR)
+                claude_spinner.start()
+                try:
+                    response = self._claude_fallback(query, data_context, expert)
+                finally:
+                    claude_spinner.stop(f"Claude responded")
                 self.stats.record(expert, "claude", used_claude=True)
             else:
                 # No Claude available — try to give data directly
@@ -1493,27 +1637,35 @@ class SclgAI:
         return any(query.strip().startswith(p) for p in cmd_prefixes)
 
     def _execute_direct_command(self, query):
-        """Execute a direct shell command."""
+        """Execute a direct shell command with visual feedback."""
         cmd = query.strip()
-        print(f"  {TOOL_CLR}● Bash({cmd[:60]}{'...' if len(cmd)>60 else ''}){C.RESET}")
+        cmd_display = cmd[:60] + ('...' if len(cmd) > 60 else '')
+        print(f"  {TOOL_CLR}● Bash({cmd_display}){C.RESET}", end="", flush=True)
 
         try:
+            t0 = time.time()
             result = subprocess.run(
                 cmd, shell=True, capture_output=True, text=True, timeout=30
             )
+            dt = time.time() - t0
             output = result.stdout
             if result.stderr:
                 output += f"\n{result.stderr}" if output else result.stderr
             if result.returncode != 0:
+                print(f"  {ERROR_CLR}✗ {dt:.1f}s{C.RESET}")
                 output = f"Exit code {result.returncode}\n{output}"
+            else:
+                print(f"  {SYSTEM_CLR}✓ {dt:.1f}s{C.RESET}")
             return output.strip() if output.strip() else "(no output)"
         except subprocess.TimeoutExpired:
+            print(f"  {ERROR_CLR}✗ timeout{C.RESET}")
             return "[TIMEOUT after 30s]"
         except Exception as e:
+            print(f"  {ERROR_CLR}✗ error{C.RESET}")
             return f"[ERROR: {e}]"
 
-    def _get_ai_response(self, query, expert, data_context=""):
-        """Get response from AI model (local or Claude)."""
+    def _get_ai_response(self, query, expert, data_context="", spinner=None):
+        """Get response from AI model (local or Claude) with spinner updates."""
         system_prompt = self._build_system_prompt(expert, data_context)
 
         # Build messages
@@ -1531,7 +1683,8 @@ class SclgAI:
             if model:
                 self.current_model = model
                 model_short = model.split(":")[0] if ":" in model else model
-                print(f"  {DIM_COLOR}{expert} → {model_short}{C.RESET}")
+                if spinner:
+                    spinner.update(f"{expert} → {model_short}")
 
                 response = self.ollama.chat(
                     model=model,
@@ -1542,13 +1695,38 @@ class SclgAI:
 
                 if response and not response.startswith("[ERROR]"):
                     return response
+                else:
+                    # First model failed — try a smaller/faster model
+                    if spinner:
+                        spinner.update(f"{model_short} failed, trying fallback...")
+                    fallback_models = ["qwen2.5:7b", "gemma2:9b", "llama3.1:8b", "phi3:mini"]
+                    fallback_model = self.ollama.find_best_model(fallback_models)
+                    if fallback_model and fallback_model != model:
+                        fb_short = fallback_model.split(":")[0] if ":" in fallback_model else fallback_model
+                        if spinner:
+                            spinner.update(f"retry → {fb_short}")
+                        self.current_model = fallback_model
+                        response = self.ollama.chat(
+                            model=fallback_model,
+                            messages=messages,
+                            system=system_prompt,
+                            temperature=config["temperature"],
+                            retries=1,
+                        )
+                        if response and not response.startswith("[ERROR]"):
+                            return response
 
         # Fallback to Claude
         if self.claude_ok and self.claude.can_use():
-            print(f"  {CLAUDE_CLR}Using Claude (local models unavailable){C.RESET}")
+            if spinner:
+                spinner.update("Claude fallback")
             return self._claude_fallback(query, data_context, expert)
 
-        return "[ERROR] No AI models available"
+        # Last resort: if we have data_context, return it raw
+        if data_context:
+            return f"Вот собранные данные:\n\n{data_context}"
+
+        return "[ERROR] No AI models available. Check GPU Balancer and Claude API."
 
     def _claude_fallback(self, query, data_context="", expert="general"):
         """Use Claude as fallback."""
@@ -1581,15 +1759,23 @@ class SclgAI:
             if not cmd:
                 continue
 
-            print(f"  {TOOL_CLR}● Bash({cmd[:60]}{'...' if len(cmd)>60 else ''}){C.RESET}")
+            cmd_display = cmd[:60] + ('...' if len(cmd) > 60 else '')
+            print(f"  {TOOL_CLR}● Bash({cmd_display}){C.RESET}", end="", flush=True)
 
             try:
+                t0 = time.time()
                 proc = subprocess.run(
                     cmd, shell=True, capture_output=True, text=True, timeout=30
                 )
+                dt = time.time() - t0
                 output = proc.stdout.strip()
                 if proc.stderr.strip():
                     output += f"\n{proc.stderr.strip()}" if output else proc.stderr.strip()
+
+                if proc.returncode == 0:
+                    print(f"  {SYSTEM_CLR}✓ {dt:.1f}s{C.RESET}")
+                else:
+                    print(f"  {WARN_CLR}⚠ exit {proc.returncode} {dt:.1f}s{C.RESET}")
 
                 # Replace the <cmd> tag with the output
                 tag = f"<cmd>{cmd}</cmd>"
@@ -1597,9 +1783,11 @@ class SclgAI:
                 result_text = result_text.replace(tag, replacement, 1)
 
             except subprocess.TimeoutExpired:
+                print(f"  {ERROR_CLR}✗ timeout{C.RESET}")
                 tag = f"<cmd>{cmd}</cmd>"
                 result_text = result_text.replace(tag, f"```\n$ {cmd}\n[TIMEOUT]\n```", 1)
             except Exception as e:
+                print(f"  {ERROR_CLR}✗ error{C.RESET}")
                 tag = f"<cmd>{cmd}</cmd>"
                 result_text = result_text.replace(tag, f"```\n$ {cmd}\n[ERROR: {e}]\n```", 1)
 
@@ -1689,9 +1877,17 @@ class SclgAI:
             print(f"\n  {CLAUDE_CLR}Claude: {r}/{CLAUDE_DAILY_LIMIT} remaining today{C.RESET}")
 
     def _show_hosts(self):
+        host_spinner = Spinner("Checking hosts", color=TOOL_CLR, style="dots")
+        host_spinner.start()
+        host_statuses = {}
+        for name, info in KNOWN_HOSTS.items():
+            host_spinner.update(f"{name} ({info['ip']})")
+            host_statuses[name] = SSHManager.check_host(info, timeout=2)
+        host_spinner.stop(f"Checked {len(KNOWN_HOSTS)} hosts")
+
         print(f"\n  {TOOL_CLR}Known hosts ({len(KNOWN_HOSTS)}):{C.RESET}")
         for name, info in KNOWN_HOSTS.items():
-            status = "●" if SSHManager.check_host(info, timeout=2) else "○"
+            status = "●" if host_statuses.get(name) else "○"
             color = SYSTEM_CLR if status == "●" else DIM_COLOR
             print(f"    {color}{status} {name:15s} {info['ip']:18s} {info.get('desc', '')}{C.RESET}")
 
@@ -1714,8 +1910,7 @@ class SclgAI:
             print(f"  {DIM_COLOR}Memory is empty{C.RESET}")
 
     def _do_scan(self, args):
-        """Execute network scan."""
-        print(f"  {NET_CLR}Scanning network...{C.RESET}")
+        """Execute network scan with spinner."""
         networks = self.scanner.get_local_networks()
         if not networks:
             print(f"  {WARN_CLR}No network interfaces found{C.RESET}")
@@ -1726,8 +1921,10 @@ class SclgAI:
             # Auto-detect subnet
             target = networks[0].rsplit(".", 1)[0] + ".0/24"
 
-        print(f"  {NET_CLR}Target: {target}{C.RESET}")
+        scan_spinner = Spinner(f"Scanning {target}", color=NET_CLR)
+        scan_spinner.start()
         hosts = self.scanner.scan_subnet(target, timeout=15)
+        scan_spinner.stop(f"Found {len(hosts)} active hosts in {target}")
         result = self.scanner.format_scan_results(networks, hosts)
         print(f"\n{result}")
 
@@ -1748,8 +1945,11 @@ class SclgAI:
             print(f"  {ERROR_CLR}Unknown host: {host_name}{C.RESET}")
             return
 
-        print(f"  {TOOL_CLR}SSH → {host_name} ({host_info['ip']}): {command[:60]}{C.RESET}")
+        ssh_spinner = Spinner(f"SSH {host_name}", color=TOOL_CLR)
+        ssh_spinner.start()
+        ssh_spinner.update(f"{host_info['ip']}: {command[:40]}")
         result = self.ssh.execute(host_info, command)
+        ssh_spinner.stop(f"SSH {host_name} complete")
         print(f"\n{result}")
 
     def _force_claude(self, query):
@@ -1761,8 +1961,10 @@ class SclgAI:
             print(f"  {ERROR_CLR}Claude is not available{C.RESET}")
             return
 
-        print(f"  {CLAUDE_CLR}Forcing Claude...{C.RESET}")
+        claude_sp = Spinner("Claude thinking", color=CLAUDE_CLR)
+        claude_sp.start()
         response = self._claude_fallback(query)
+        claude_sp.stop("Claude responded")
         response = self.cleaner.clean(response)
         print(f"\n{AI_COLOR}{response}{C.RESET}")
 
