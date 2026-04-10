@@ -906,10 +906,63 @@ class StatsTracker:
 # ── Utilities ───────────────────────────────────────────────────────
 
 def get_terminal_width():
+    """Get terminal width using multiple fallback methods."""
+    # Method 1: os.get_terminal_size (works when stdout is a TTY)
     try:
-        return os.get_terminal_size().columns
-    except:
-        return 80
+        cols = os.get_terminal_size().columns
+        if cols > 40:
+            return cols
+    except (OSError, ValueError):
+        pass
+
+    # Method 2: COLUMNS environment variable
+    try:
+        cols = int(os.environ.get('COLUMNS', 0))
+        if cols > 40:
+            return cols
+    except (ValueError, TypeError):
+        pass
+
+    # Method 3: stty size (works on macOS/Linux even without TTY on stdout)
+    try:
+        r = subprocess.run(
+            ['stty', 'size'],
+            capture_output=True, text=True, timeout=2,
+            stdin=open('/dev/tty') if os.path.exists('/dev/tty') else None
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            parts = r.stdout.strip().split()
+            if len(parts) >= 2:
+                cols = int(parts[1])
+                if cols > 40:
+                    return cols
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+
+    # Method 4: tput cols
+    try:
+        r = subprocess.run(
+            ['tput', 'cols'],
+            capture_output=True, text=True, timeout=2,
+            env={**os.environ, 'TERM': os.environ.get('TERM', 'xterm-256color')}
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            cols = int(r.stdout.strip())
+            if cols > 40:
+                return cols
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+
+    # Method 5: shutil (last resort, often returns 80)
+    try:
+        import shutil
+        cols = shutil.get_terminal_size().columns
+        if cols > 40:
+            return cols
+    except Exception:
+        pass
+
+    return 120  # Reasonable default for modern terminals
 
 def clear_screen():
     print("\033[2J\033[H", end="")
