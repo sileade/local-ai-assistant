@@ -374,6 +374,12 @@ SMART_PATTERNS = [
     (["wifi", "wi-fi", "вайфай", "wireless", "беспроводн"],
      ["echo '=== WiFi Info ===' && (/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport -I 2>/dev/null || iwconfig 2>/dev/null || nmcli dev wifi list 2>/dev/null || echo 'Нет WiFi данных')"],
      "sysadmin"),
+
+    # ── Grafana / Dashboards ──
+    (["grafana", "графана", "дашборд", "dashboard", "панель мониторинга", "панель grafana"],
+     ["echo '=== Grafana Dashboards ===' && curl -s -H \"Authorization: Bearer $GRAFANA_TOKEN\" \"$GRAFANA_URL/api/search?type=dash-db\" 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); [print(f'- {m[\\\"title\\\"]} (uid: {m[\\\"uid\\\"]})') for m in d]\" || echo 'Grafana API недоступен'",
+      "echo '=== Recent Alerts ===' && curl -s -H \"Authorization: Bearer $GRAFANA_TOKEN\" \"$GRAFANA_URL/api/alerts\" 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); [print(f'- {a[\\\"name\\\"]} [{a[\\\"state\\\"]}]') for a in d[:10]]\" || echo 'Alerts API недоступен'"],
+     "sysadmin"),
 ]
 
 # ── Scan Keywords ──────────────────────────────────────────────────
@@ -1589,6 +1595,18 @@ class SmartExecutor:
     def match(self, query):
         """Find matching pattern for a query."""
         query_low = query.lower()
+
+        # ── Grafana URL Auto-Detection ──
+        # Example: https://grafana.sclg.io/d/main-dashboard/main-dashboard?orgId=1
+        if "grafana" in query_low and "/d/" in query_low:
+            import re
+            match = re.search(r"/d/([^/?#]+)", query)
+            if match:
+                uid = match.group(1)
+                # Use .format() to avoid backslash in f-string expression (Python 3.11 limitation)
+                cmd1 = "echo '=== Dashboard Info (UID: {uid}) ===' && curl -s -H \"Authorization: Bearer $GRAFANA_TOKEN\" \"$GRAFANA_URL/api/dashboards/uid/{uid}\" 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); print(f'Title: {{d.get(\\\"dashboard\\\",{{}}).get(\\\"title\\\")}}'); [print(f'- Panel: {{p.get(\\\"title\\\")}} ({{p.get(\\\"type\\\")}})') for p in d.get(\\\"dashboard\\\",{{}}).get(\\\"panels\\\",[])]\" || echo 'Dashboard API error'".format(uid=uid)
+                cmd2 = "echo '=== Recent Alerts for Dashboard ===' && curl -s -H \"Authorization: Bearer $GRAFANA_TOKEN\" \"$GRAFANA_URL/api/alerts?dashboardId={uid}\" 2>/dev/null || echo 'No alerts found'".format(uid=uid)
+                return [cmd1, cmd2], "sysadmin"
 
         # Check scan keywords first (special handling)
         for kw in self.scan_keywords:
