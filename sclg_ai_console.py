@@ -998,12 +998,15 @@ def draw_hline(char="─", color=BORDER_CLR):
 def draw_dashed():
     print(f"{BORDER_CLR}{'┄' * get_terminal_width()}{C.RESET}")
 
-CLAW_MINI = """     █▀▄    ▄▀█
-     ██ ▀▀▀▀ ██
-     ██ ●  ● ██
-     ▀█ ▀██▀ █▀
-      ▀▄▄▄▄▄▄▀
-        ▀▀▀▀"""
+# All lines exactly 14 chars for uniform block centering
+CLAW_MINI = [
+    " .---.  .---. ",   # ears
+    " |   '--'   | ",   # top
+    " | [ o  o ] | ",   # eyes
+    " |  '-..-'  | ",   # mouth
+    " '---. __ .-' ",   # jaw
+    "    '----'    ",   # chin
+]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2824,7 +2827,7 @@ class SclgAI:
         dyn = self._get_dynamic_data()
 
         # Build left column lines (centered logo as a single block)
-        logo_raw = CLAW_MINI.strip().split("\n")
+        logo_raw = CLAW_MINI  # Already a list of equal-width lines
         # Find max logo line width to treat as one block
         max_logo_w = max(len(line) for line in logo_raw)
         # Calculate single offset to center the WHOLE block
