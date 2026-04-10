@@ -907,7 +907,37 @@ class StatsTracker:
 
 def get_terminal_width():
     """Get terminal width using multiple fallback methods."""
-    # Method 1: os.get_terminal_size (works when stdout is a TTY)
+    import struct
+
+    # Method 1: fcntl.ioctl on /dev/tty (most reliable on macOS)
+    try:
+        import fcntl, termios
+        fd = os.open('/dev/tty', os.O_RDONLY)
+        try:
+            result = fcntl.ioctl(fd, termios.TIOCGWINSZ, b'\x00' * 8)
+            rows, cols = struct.unpack('HHHH', result)[:2]
+            if cols > 40:
+                return cols
+        finally:
+            os.close(fd)
+    except Exception:
+        pass
+
+    # Method 2: fcntl.ioctl on stdout/stderr/stdin
+    try:
+        import fcntl, termios
+        for fd_num in (1, 2, 0):  # stdout, stderr, stdin
+            try:
+                result = fcntl.ioctl(fd_num, termios.TIOCGWINSZ, b'\x00' * 8)
+                rows, cols = struct.unpack('HHHH', result)[:2]
+                if cols > 40:
+                    return cols
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Method 3: os.get_terminal_size
     try:
         cols = os.get_terminal_size().columns
         if cols > 40:
@@ -915,7 +945,7 @@ def get_terminal_width():
     except (OSError, ValueError):
         pass
 
-    # Method 2: COLUMNS environment variable
+    # Method 4: COLUMNS env var
     try:
         cols = int(os.environ.get('COLUMNS', 0))
         if cols > 40:
@@ -923,37 +953,32 @@ def get_terminal_width():
     except (ValueError, TypeError):
         pass
 
-    # Method 3: stty size (works on macOS/Linux even without TTY on stdout)
+    # Method 5: stty size via /dev/tty
     try:
-        r = subprocess.run(
-            ['stty', 'size'],
-            capture_output=True, text=True, timeout=2,
-            stdin=open('/dev/tty') if os.path.exists('/dev/tty') else None
-        )
-        if r.returncode == 0 and r.stdout.strip():
-            parts = r.stdout.strip().split()
-            if len(parts) >= 2:
-                cols = int(parts[1])
-                if cols > 40:
-                    return cols
-    except (OSError, ValueError, subprocess.TimeoutExpired):
+        with open('/dev/tty') as tty:
+            r = subprocess.run(['stty', 'size'], capture_output=True, text=True,
+                               timeout=2, stdin=tty)
+            if r.returncode == 0 and r.stdout.strip():
+                parts = r.stdout.strip().split()
+                if len(parts) >= 2:
+                    cols = int(parts[1])
+                    if cols > 40:
+                        return cols
+    except Exception:
         pass
 
-    # Method 4: tput cols
+    # Method 6: tput cols
     try:
-        r = subprocess.run(
-            ['tput', 'cols'],
-            capture_output=True, text=True, timeout=2,
-            env={**os.environ, 'TERM': os.environ.get('TERM', 'xterm-256color')}
-        )
+        r = subprocess.run(['tput', 'cols'], capture_output=True, text=True, timeout=2,
+                           env={**os.environ, 'TERM': os.environ.get('TERM', 'xterm-256color')})
         if r.returncode == 0 and r.stdout.strip():
             cols = int(r.stdout.strip())
             if cols > 40:
                 return cols
-    except (OSError, ValueError, subprocess.TimeoutExpired):
+    except Exception:
         pass
 
-    # Method 5: shutil (last resort, often returns 80)
+    # Method 7: shutil fallback
     try:
         import shutil
         cols = shutil.get_terminal_size().columns
