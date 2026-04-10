@@ -11,6 +11,7 @@
 ║  - local-ai-assistant (monitoring, roles)                 ║
 ║  - nanobot (Dream memory, skills, lifecycle hooks)        ║
 ║  - avoid-ai-writing (anti-AI-isms post-processor)         ║
+║  - InfraLearner (background self-learning from Grafana)    ║
 ╚═══════════════════════════════════════════════════════════╝
 """
 
@@ -31,6 +32,8 @@ import hashlib
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from dataclasses import dataclass, asdict
+from collections import defaultdict
 
 # ── ANSI Color Codes ────────────────────────────────────────────────
 
@@ -80,7 +83,7 @@ SKILL_CLR   = C.rgb(120, 220, 200)
 
 # ── Configuration ───────────────────────────────────────────────────
 
-VERSION = "4.2.0"
+VERSION = "4.3.0"
 APP_NAME = "Scoliologic AI"
 
 GPU_BALANCER_URL = "http://10.0.0.229:11440"
@@ -105,11 +108,29 @@ MEMORY_FILE      = os.path.join(DATA_DIR, "memory.json")
 CACHE_FILE       = os.path.join(DATA_DIR, "cache.json")
 SKILLS_DIR       = os.path.join(DATA_DIR, "skills")
 STATS_FILE       = os.path.join(DATA_DIR, "stats.json")
+KNOWLEDGE_DIR    = os.path.join(DATA_DIR, "knowledge")
+BASELINES_FILE   = os.path.join(KNOWLEDGE_DIR, "baselines", "baselines.json")
+INSIGHTS_FILE    = os.path.join(KNOWLEDGE_DIR, "insights", "insights.json")
+ANOMALIES_FILE   = os.path.join(KNOWLEDGE_DIR, "anomalies", "recent.json")
+LEARNER_STATS_FILE = os.path.join(KNOWLEDGE_DIR, "stats.json")
+PRIORITY_LOCK    = os.path.join(KNOWLEDGE_DIR, "priority.lock")
+
+# ── Grafana / Monitoring ───────────────────────────────────────────
+
+GRAFANA_URL   = os.environ.get("GRAFANA_URL", "https://grafana.sclg.io")
+GRAFANA_TOKEN = os.environ.get("GRAFANA_TOKEN", "")
+PROMETHEUS_DS_UID = "efdhopzhssvswb"  # Grafana datasource UID for Prometheus
+LOKI_DS_UID       = "P8E80F9AEF21F6940"
 
 # Ensure data directory exists
 os.makedirs(DATA_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs(SKILLS_DIR, exist_ok=True)
+os.makedirs(KNOWLEDGE_DIR, exist_ok=True)
+os.makedirs(os.path.join(KNOWLEDGE_DIR, "baselines"), exist_ok=True)
+os.makedirs(os.path.join(KNOWLEDGE_DIR, "insights"), exist_ok=True)
+os.makedirs(os.path.join(KNOWLEDGE_DIR, "anomalies"), exist_ok=True)
+os.makedirs(os.path.join(KNOWLEDGE_DIR, "metrics"), exist_ok=True)
 
 # ── Claude API Configuration ───────────────────────────────────────
 
@@ -1411,6 +1432,186 @@ class SSHManager:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# INFRA LEARNER BRIDGE — Background Self-Learning
+# ══════════════════════════════════════════════════════════════════════
+
+import ssl as _ssl
+
+class InfraLearnerBridge:
+    """Bridge to InfraLearner knowledge base for use in sclg-ai.
+    
+    Reads knowledge base files written by the InfraLearner daemon.
+    Signals priority when user is active.
+    Can run quick metric collection inline.
+    """
+
+    def __init__(self):
+        self.enabled = os.path.isdir(KNOWLEDGE_DIR)
+        self._ssl_ctx = _ssl.create_default_context()
+        self._ssl_ctx.check_hostname = False
+        self._ssl_ctx.verify_mode = _ssl.CERT_NONE
+        self._grafana_headers = {
+            "Authorization": f"Bearer {GRAFANA_TOKEN}",
+            "Content-Type": "application/json"
+        }
+
+    # ── Priority signaling ─────────────────────────────────────────
+
+    def signal_user_active(self):
+        """Tell InfraLearner daemon to pause."""
+        try:
+            with open(PRIORITY_LOCK, "w") as f:
+                json.dump({"user_active": True, "since": datetime.now().isoformat()}, f)
+        except Exception:
+            pass
+
+    def signal_user_idle(self):
+        """Tell InfraLearner daemon it can resume."""
+        try:
+            if os.path.exists(PRIORITY_LOCK):
+                os.unlink(PRIORITY_LOCK)
+        except Exception:
+            pass
+
+    # ── Knowledge base reading ────────────────────────────────────
+
+    def get_insights(self, query: str = "", limit: int = 10) -> list:
+        """Get relevant insights from knowledge base."""
+        if not os.path.exists(INSIGHTS_FILE):
+            return []
+        try:
+            with open(INSIGHTS_FILE) as f:
+                insights = json.load(f)
+            if query:
+                keywords = set(query.lower().split())
+                scored = []
+                for ins in insights:
+                    text = f"{ins.get('title','')} {ins.get('description','')} {ins.get('category','')}".lower()
+                    score = sum(1 for kw in keywords if kw in text)
+                    if score > 0:
+                        scored.append((score, ins))
+                scored.sort(key=lambda x: -x[0])
+                return [s[1] for s in scored[:limit]]
+            return insights[-limit:]
+        except Exception:
+            return []
+
+    def get_baselines(self) -> dict:
+        """Get metric baselines."""
+        if not os.path.exists(BASELINES_FILE):
+            return {}
+        try:
+            with open(BASELINES_FILE) as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def get_anomalies(self, hours: int = 24) -> list:
+        """Get recent anomalies."""
+        if not os.path.exists(ANOMALIES_FILE):
+            return []
+        try:
+            with open(ANOMALIES_FILE) as f:
+                anomalies = json.load(f)
+            from datetime import timedelta
+            cutoff = (datetime.now() - timedelta(hours=hours)).isoformat()
+            return [a for a in anomalies if a.get("timestamp", "") > cutoff]
+        except Exception:
+            return []
+
+    def get_learner_status(self) -> dict:
+        """Get InfraLearner daemon status."""
+        if not os.path.exists(LEARNER_STATS_FILE):
+            return {"running": False}
+        try:
+            with open(LEARNER_STATS_FILE) as f:
+                stats = json.load(f)
+            # Check if daemon is alive (last cycle within 10 min)
+            last = stats.get("last_cycle", "")
+            if last:
+                from datetime import timedelta
+                try:
+                    last_dt = datetime.fromisoformat(last)
+                    stats["running"] = (datetime.now() - last_dt).total_seconds() < 600
+                except Exception:
+                    stats["running"] = False
+            else:
+                stats["running"] = False
+            return stats
+        except Exception:
+            return {"running": False}
+
+    def get_knowledge_context(self, query: str) -> str:
+        """Build knowledge context string for AI prompt enrichment."""
+        parts = []
+        
+        # Relevant insights
+        insights = self.get_insights(query, limit=5)
+        if insights:
+            parts.append("\nЗНАНИЯ ОБ ИНФРАСТРУКТУРЕ (из фонового обучения):")
+            for ins in insights:
+                cat = ins.get("category", "")
+                title = ins.get("title", "")
+                desc = ins.get("description", "")
+                conf = ins.get("confidence", 0)
+                parts.append(f"  [{cat.upper()}] {title}: {desc} (confidence: {conf:.0%})")
+        
+        # Recent anomalies
+        anomalies = self.get_anomalies(hours=6)
+        if anomalies:
+            critical = [a for a in anomalies if a.get("severity") == "critical"]
+            warning = [a for a in anomalies if a.get("severity") == "warning"]
+            if critical or warning:
+                parts.append(f"\nАНОМАЛИИ: {len(critical)} critical, {len(warning)} warning")
+                for a in (critical + warning)[:3]:
+                    parts.append(f"  [{a.get('severity','').upper()}] {a.get('description', '')}")
+        
+        return "\n".join(parts) if parts else ""
+
+    # ── Quick Grafana queries (inline, no daemon needed) ───────────
+
+    def _grafana_api(self, endpoint: str) -> dict:
+        """Quick Grafana API call."""
+        try:
+            url = f"{GRAFANA_URL}/api/{endpoint}"
+            req = urllib.request.Request(url, headers=self._grafana_headers)
+            resp = urllib.request.urlopen(req, timeout=15, context=self._ssl_ctx)
+            return json.loads(resp.read().decode())
+        except Exception:
+            return {}
+
+    def prometheus_query(self, query: str) -> dict:
+        """Query Prometheus via Grafana proxy."""
+        params = urllib.parse.urlencode({"query": query})
+        endpoint = f"datasources/proxy/uid/{PROMETHEUS_DS_UID}/api/v1/query?{params}"
+        return self._grafana_api(endpoint)
+
+    def get_gpu_status(self) -> str:
+        """Quick GPU status from Prometheus."""
+        lines = []
+        for metric, label in [("ai_gpu_temperature_celsius", "temp"),
+                              ("ai_gpu_utilization_percent", "util"),
+                              ("ai_gpu_power_draw_watts", "power")]:
+            result = self.prometheus_query(metric)
+            data = result.get("data", {}).get("result", [])
+            for r in data:
+                gpu_id = r.get("metric", {}).get("gpu_id", "?")
+                val = r.get("value", [0, "?"])[1]
+                lines.append(f"GPU{gpu_id} {label}: {val}")
+        return "\n".join(lines) if lines else "GPU data unavailable"
+
+    def get_alerts(self) -> list:
+        """Get current Grafana alerts."""
+        result = self._grafana_api("alertmanager/grafana/api/v2/alerts")
+        return result if isinstance(result, list) else []
+
+    def get_dashboards(self) -> list:
+        """Get all dashboards."""
+        result = self._grafana_api("search?type=dash-db")
+        return result if isinstance(result, list) else []
+
+
+# ══════════════════════════════════════════════════════════════════════
 # SCLG-AI MAIN CLASS — The Agent
 # ══════════════════════════════════════════════════════════════════════
 
@@ -1431,6 +1632,7 @@ class SclgAI:
         self.cache = RequestCache()
         self.stats = StatsTracker()
         self.training = TrainingCollector()
+        self.learner = InfraLearnerBridge()
 
         # State
         self.conversation = []
@@ -1486,6 +1688,21 @@ class SclgAI:
             spinner2.stop()
             print(f"  {WARN_CLR}⚠ Claude unavailable{C.RESET}")
 
+        # Check InfraLearner & Grafana
+        spinner3 = Spinner("Checking Grafana & InfraLearner", color=SKILL_CLR, style="dots")
+        spinner3.start()
+        learner_status = self.learner.get_learner_status()
+        grafana_ok = bool(self.learner.get_dashboards())
+        if learner_status.get("running"):
+            cycles = learner_status.get("total_cycles", 0)
+            insights = learner_status.get("total_insights_generated", 0)
+            spinner3.stop(f"✓ InfraLearner: {cycles} cycles, {insights} insights")
+        elif grafana_ok:
+            spinner3.stop(f"✓ Grafana OK, InfraLearner not running")
+        else:
+            spinner3.stop()
+            print(f"  {DIM_COLOR}○ Grafana/InfraLearner not available{C.RESET}")
+
     # ── System Prompt Builder ───────────────────────────────────────
 
     def _build_system_prompt(self, expert="general", data_context=""):
@@ -1520,6 +1737,11 @@ class SclgAI:
         if mem_ctx:
             base += f"\n{mem_ctx}\n"
 
+        # Add knowledge from InfraLearner
+        knowledge_ctx = self.learner.get_knowledge_context(data_context or "")
+        if knowledge_ctx:
+            base += f"\n{knowledge_ctx}\n"
+
         # Add collected data context
         if data_context:
             base += f"""
@@ -1538,6 +1760,9 @@ class SclgAI:
 
     def process_query(self, query):
         """Process a user query — the main brain of the agent."""
+
+        # Signal InfraLearner to pause (user is active)
+        self.learner.signal_user_active()
 
         # Step 0: Check cache
         cached = self.cache.get(query)
@@ -1838,6 +2063,14 @@ class SclgAI:
             self._do_ssh(args)
         elif command in ("/claude",):
             self._force_claude(args)
+        elif command in ("/knowledge", "/k", "/learn"):
+            self._show_knowledge(args)
+        elif command in ("/anomalies", "/anom"):
+            self._show_anomalies()
+        elif command in ("/gpu",):
+            self._show_gpu()
+        elif command in ("/grafana", "/graf"):
+            self._show_grafana()
         elif command in ("/version", "/v"):
             print(f"  sclg-ai v{VERSION}")
         elif command in ("/quit", "/q", "/exit"):
@@ -1857,6 +2090,10 @@ class SclgAI:
   {TOOL_CLR}/scan{C.RESET} [net] — Scan network
   {TOOL_CLR}/ssh{C.RESET} host cmd — Execute command on remote host
   {TOOL_CLR}/claude{C.RESET} q  — Force Claude for this query
+  {TOOL_CLR}/knowledge{C.RESET} — Show learned infrastructure knowledge
+  {TOOL_CLR}/anomalies{C.RESET} — Show recent anomalies
+  {TOOL_CLR}/gpu{C.RESET}       — Show GPU status from Grafana
+  {TOOL_CLR}/grafana{C.RESET}   — Show Grafana dashboards
   {TOOL_CLR}/clear{C.RESET}     — Clear conversation
   {TOOL_CLR}/new{C.RESET}       — New session (consolidate memory)
   {TOOL_CLR}/version{C.RESET}   — Show version
@@ -1968,7 +2205,85 @@ class SclgAI:
         response = self.cleaner.clean(response)
         print(f"\n{AI_COLOR}{response}{C.RESET}")
 
-    # ── Banner ──────────────────────────────────────────────────────
+    def _show_knowledge(self, query=""):
+        """Show learned infrastructure knowledge."""
+        insights = self.learner.get_insights(query, limit=15)
+        if not insights:
+            print(f"  {DIM_COLOR}No knowledge yet. InfraLearner needs to run first.{C.RESET}")
+            print(f"  {DIM_COLOR}Start it with: sclg-infra-learner --once{C.RESET}")
+            return
+
+        print(f"\n{ACCENT}━━━ Infrastructure Knowledge ({len(insights)} insights) ━━━{C.RESET}")
+        for ins in insights:
+            cat = ins.get("category", "general")
+            title = ins.get("title", "")
+            desc = ins.get("description", "")
+            conf = ins.get("confidence", 0)
+            severity = ins.get("severity", "info")
+
+            sev_color = {"critical": ERROR_CLR, "warning": WARN_CLR, "info": SYSTEM_CLR}.get(severity, DIM_COLOR)
+            print(f"  {sev_color}[{cat.upper()}]{C.RESET} {C.BOLD}{title}{C.RESET}")
+            print(f"    {desc}")
+            print(f"    {DIM_COLOR}confidence: {conf:.0%}{C.RESET}")
+        print()
+
+    def _show_anomalies(self):
+        """Show recent anomalies."""
+        anomalies = self.learner.get_anomalies(hours=24)
+        if not anomalies:
+            print(f"  {SYSTEM_CLR}✓ No anomalies in the last 24 hours{C.RESET}")
+            return
+
+        print(f"\n{ACCENT}━━━ Anomalies (last 24h): {len(anomalies)} ━━━{C.RESET}")
+        for a in anomalies[:20]:
+            sev = a.get("severity", "info")
+            desc = a.get("description", "")
+            metric = a.get("metric", "")
+            ts = a.get("timestamp", "")[:19]
+            sev_color = {"critical": ERROR_CLR, "warning": WARN_CLR}.get(sev, DIM_COLOR)
+            print(f"  {sev_color}[{sev.upper()}]{C.RESET} {ts} {metric}: {desc}")
+        print()
+
+    def _show_gpu(self):
+        """Show GPU status from Grafana/Prometheus."""
+        spinner = Spinner("Querying GPU metrics", color=TOOL_CLR)
+        spinner.start()
+        gpu_text = self.learner.get_gpu_status()
+        spinner.stop("GPU data received")
+        if gpu_text:
+            print(f"\n{ACCENT}━━━ GPU Status ━━━{C.RESET}")
+            print(f"  {gpu_text}")
+        else:
+            print(f"  {WARN_CLR}GPU data unavailable{C.RESET}")
+        print()
+
+    def _show_grafana(self):
+        """Show Grafana dashboards."""
+        spinner = Spinner("Fetching dashboards", color=SKILL_CLR)
+        spinner.start()
+        dashboards = self.learner.get_dashboards()
+        alerts = self.learner.get_alerts()
+        spinner.stop(f"{len(dashboards)} dashboards, {len(alerts)} alerts")
+
+        if dashboards:
+            print(f"\n{ACCENT}━━━ Grafana Dashboards ━━━{C.RESET}")
+            for d in dashboards[:15]:
+                title = d.get("title", "?")
+                uid = d.get("uid", "")
+                url = f"{GRAFANA_URL}/d/{uid}"
+                print(f"  {TOOL_CLR}●{C.RESET} {title} {DIM_COLOR}({url}){C.RESET}")
+
+        if alerts:
+            print(f"\n{ACCENT}━━━ Active Alerts ({len(alerts)}) ━━━{C.RESET}")
+            for a in alerts[:10]:
+                labels = a.get("labels", {})
+                name = labels.get("alertname", "?")
+                severity = labels.get("severity", "info")
+                sev_color = {"critical": ERROR_CLR, "warning": WARN_CLR}.get(severity, DIM_COLOR)
+                print(f"  {sev_color}[{severity.upper()}]{C.RESET} {name}")
+        print()
+
+    # ── Banner ──────────────────────────────────────────────────────────────
 
     def show_banner(self):
         """Show startup banner."""
@@ -1990,6 +2305,7 @@ class SclgAI:
                               {TOOL_CLR}✎ SSH to any host/router{C.RESET}
                               {CLAUDE_CLR}🧠 MoE expert routing{C.RESET}
                               {MEMORY_CLR}💭 Dream memory{C.RESET}
+                              {SKILL_CLR}📊 InfraLearner (self-learning){C.RESET}
 """)
 
     def show_status(self):
@@ -2065,6 +2381,9 @@ class SclgAI:
                 expert_str = self.current_expert or "general"
                 print(f"\n  {DIM_COLOR}⟨{expert_str} → {model_str} · {elapsed:.1f}s⟩{C.RESET}")
 
+                # Signal InfraLearner it can resume
+                self.learner.signal_user_idle()
+
                 # Update conversation
                 self.conversation.append({"role": "user", "content": user_input})
                 self.conversation.append({"role": "assistant", "content": response[:2000]})
@@ -2080,6 +2399,7 @@ class SclgAI:
                 break
 
         # Cleanup
+        self.learner.signal_user_idle()
         self._save_history()
         self.memory.consolidate()
         print(f"\n{DIM_COLOR}Session saved. Goodbye.{C.RESET}")
