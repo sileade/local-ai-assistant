@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔═══════════════════════════════════════════════════════════╗
-║  Scoliologic AI Console (sclg-ai) v4.2.0                 ║
+║  Scoliologic AI Console (sclg-ai) v4.3.1                 ║
 ║  Autonomous DevOps/SysAdmin Agent                        ║
 ║  Execute first, explain later — like Claude Code          ║
 ║                                                           ║
@@ -83,7 +83,7 @@ SKILL_CLR   = C.rgb(120, 220, 200)
 
 # ── Configuration ───────────────────────────────────────────────────
 
-VERSION = "4.3.0"
+VERSION = "4.3.1"
 APP_NAME = "Scoliologic AI"
 
 GPU_BALANCER_URL = "http://10.0.0.229:11440"
@@ -341,6 +341,37 @@ SMART_PATTERNS = [
     # ── Users ──
     (["пользовател", "user", "кто залогинен", "who"],
      ["who 2>/dev/null || w 2>/dev/null", "last -10 2>/dev/null"],
+     "sysadmin"),
+
+    # ── Speed Test / Bandwidth ──
+    (["скорость сети", "скорость интернет", "speed test", "speedtest", "bandwidth",
+      "пропускная способность", "скорость соединения", "скорость подключения",
+      "проверь скорость", "тест скорости", "internet speed", "download speed",
+      "upload speed", "скорость загрузки", "скорость скачивания", "пинг до",
+      "latency", "задержка сети"],
+     ["echo '=== Speed Test ===' && (speedtest-cli --simple 2>/dev/null || speedtest --simple 2>/dev/null || (echo 'speedtest-cli не установлен, используем curl...' && echo -n 'Download: ' && curl -s -o /dev/null -w '%{speed_download}' http://speedtest.tele2.net/10MB.zip 2>/dev/null | python3 -c \"import sys; b=float(sys.stdin.read()); print(f'{b/1024/1024:.2f} MB/s')\" && echo -n 'Upload: ' && dd if=/dev/zero bs=1M count=5 2>/dev/null | curl -s -o /dev/null -w '%{speed_upload}' -X POST -d @- http://speedtest.tele2.net/upload.php 2>/dev/null | python3 -c \"import sys; b=float(sys.stdin.read()); print(f'{b/1024/1024:.2f} MB/s')\"))",
+      "echo '=== Ping Test ===' && ping -c 5 8.8.8.8 2>/dev/null | tail -3",
+      "echo '=== DNS Speed ===' && (time nslookup google.com 2>&1 | grep -E 'real|Address') 2>&1 | head -5",
+      "echo '=== Route ===' && traceroute -m 5 8.8.8.8 2>/dev/null || tracepath -m 5 8.8.8.8 2>/dev/null || echo 'traceroute not available'"],
+     "sysadmin"),
+
+    # ── Ping / Connectivity ──
+    (["пингани", "пинг ", "ping ", "пропингуй", "достучаться до", "доступен ли",
+      "проверь связь", "проверь доступность", "check connectivity"],
+     ["ping -c 4 8.8.8.8 2>/dev/null",
+      "ping -c 4 1.1.1.1 2>/dev/null",
+      "curl -s -o /dev/null -w 'HTTP %{http_code} in %{time_total}s' https://google.com 2>/dev/null"],
+     "sysadmin"),
+
+    # ── Temperature / Hardware Health ──
+    (["температур", "temperature", "нагрев", "перегрев", "thermal", "fan", "вентилятор"],
+     ["echo '=== CPU Temperature ===' && (cat /sys/class/thermal/thermal_zone*/temp 2>/dev/null | while read t; do echo $((t/1000))°C; done || sudo powermetrics --samplers smc -i1 -n1 2>/dev/null | grep -i temp || echo 'Нет данных о температуре')",
+      "echo '=== GPU Temperature ===' && (nvidia-smi --query-gpu=temperature.gpu --format=csv,noheader 2>/dev/null || echo 'Нет NVIDIA GPU')"],
+     "sysadmin"),
+
+    # ── WiFi ──
+    (["wifi", "wi-fi", "вайфай", "wireless", "беспроводн"],
+     ["echo '=== WiFi Info ===' && (/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport -I 2>/dev/null || iwconfig 2>/dev/null || nmcli dev wifi list 2>/dev/null || echo 'Нет WiFi данных')"],
      "sysadmin"),
 ]
 
@@ -1752,6 +1783,8 @@ class SclgAI:
 ВАЖНО: Данные выше — РЕАЛЬНЫЕ результаты команд, выполненных на ЭТОЙ машине.
 Ты ОБЯЗАН проанализировать эти данные и дать конкретный ответ.
 НЕ ГОВОРИ "я не могу" — данные УЖЕ собраны для тебя.
+НЕ пересказывай сырые данные — АНАЛИЗИРУЙ их: выдели ключевое, сделай выводы, предложи действия.
+Формат: краткий ответ с таблицами и выводами, а не копипаст команд.
 """
 
         return base
@@ -1791,10 +1824,32 @@ class SclgAI:
         # Step 4: If sysadmin query but no pattern matched, try generic commands
         if not data_context and self.executor.is_sysadmin_query(query):
             print(f"  {TOOL_CLR}⚡ Running system check...{C.RESET}")
-            generic_cmds = [
-                "hostname && uname -a",
-                "ifconfig 2>/dev/null | grep 'inet ' || ip addr show 2>/dev/null | grep 'inet '",
-            ]
+            # Build context-aware generic commands based on query keywords
+            generic_cmds = ["hostname && uname -a"]
+            q_low = query.lower()
+            if any(w in q_low for w in ["сет", "network", "ip", "dns", "подключ", "connect"]):
+                generic_cmds.extend([
+                    "ifconfig 2>/dev/null | grep -E 'inet |flags' || ip addr show 2>/dev/null",
+                    "netstat -rn 2>/dev/null | grep default | head -5 || ip route show default 2>/dev/null",
+                    "cat /etc/resolv.conf 2>/dev/null || scutil --dns 2>/dev/null | grep nameserver | head -5",
+                ])
+            elif any(w in q_low for w in ["диск", "disk", "место", "storage"]):
+                generic_cmds.append("df -h 2>/dev/null")
+            elif any(w in q_low for w in ["памят", "memory", "ram"]):
+                generic_cmds.append("free -h 2>/dev/null || vm_stat 2>/dev/null")
+            elif any(w in q_low for w in ["процесс", "process", "запущен"]):
+                generic_cmds.append("ps aux --sort=-%mem 2>/dev/null | head -20")
+            elif any(w in q_low for w in ["скорост", "speed", "bandwidth", "пинг"]):
+                generic_cmds.extend([
+                    "ping -c 3 8.8.8.8 2>/dev/null | tail -2",
+                    "speedtest-cli --simple 2>/dev/null || curl -s -o /dev/null -w 'Download speed: %{speed_download} bytes/s\n' http://speedtest.tele2.net/10MB.zip 2>/dev/null",
+                ])
+            else:
+                generic_cmds.extend([
+                    "ifconfig 2>/dev/null | grep 'inet ' || ip addr show 2>/dev/null | grep 'inet '",
+                    "uptime 2>/dev/null",
+                    "df -h 2>/dev/null | head -5",
+                ])
             data_context = self.executor.execute(generic_cmds)
 
         # Step 5: Get AI response (with spinner)
@@ -1819,9 +1874,9 @@ class SclgAI:
                     claude_spinner.stop(f"Claude responded")
                 self.stats.record(expert, "claude", used_claude=True)
             else:
-                # No Claude available — try to give data directly
+                # No Claude available — format data nicely as fallback
                 if data_context:
-                    response = f"Вот собранные данные:\n\n{data_context}"
+                    response = self._format_raw_data(query, data_context)
         else:
             model_name = self.current_model or "unknown"
             self.stats.record(expert, model_name)
@@ -1947,11 +2002,45 @@ class SclgAI:
                 spinner.update("Claude fallback")
             return self._claude_fallback(query, data_context, expert)
 
-        # Last resort: if we have data_context, return it raw
+        # Last resort: if we have data_context, format it nicely
         if data_context:
-            return f"Вот собранные данные:\n\n{data_context}"
+            return f"Результаты выполненных команд:\n\n{data_context}\n\n{C.DIM}(АИ недоступен для анализа — показаны сырые данные){C.RESET}"
 
         return "[ERROR] No AI models available. Check GPU Balancer and Claude API."
+
+    def _format_raw_data(self, query, data_context):
+        """Format raw command output nicely when AI is unavailable."""
+        q_low = query.lower()
+        header = "Результаты системной проверки"
+        if any(w in q_low for w in ["скорост", "speed", "bandwidth"]):
+            header = "Тест скорости сети"
+        elif any(w in q_low for w in ["сет", "network", "ip", "dns"]):
+            header = "Сетевая информация"
+        elif any(w in q_low for w in ["диск", "disk", "место"]):
+            header = "Информация о дисках"
+        elif any(w in q_low for w in ["памят", "memory", "ram"]):
+            header = "Информация о памяти"
+        elif any(w in q_low for w in ["процесс", "process"]):
+            header = "Запущенные процессы"
+        elif any(w in q_low for w in ["скан", "scan", "хост", "host"]):
+            header = "Результаты сканирования"
+        elif any(w in q_low for w in ["gpu", "видеокарт"]):
+            header = "Информация о GPU"
+
+        lines = []
+        lines.append(f"\n{ACCENT1}━━━ {header} ━━━{C.RESET}\n")
+        # Parse sections from data_context
+        for line in data_context.split('\n'):
+            if line.startswith('$ '):
+                lines.append(f"{DIM_COLOR}{line}{C.RESET}")
+            elif line.startswith('==='):
+                lines.append(f"\n{ACCENT2}{line}{C.RESET}")
+            elif 'error' in line.lower() or 'fail' in line.lower():
+                lines.append(f"{ERROR_CLR}{line}{C.RESET}")
+            else:
+                lines.append(line)
+        lines.append(f"\n{DIM_COLOR}(АИ недоступен — показаны сырые данные. Попробуйте /claude для анализа){C.RESET}")
+        return '\n'.join(lines)
 
     def _claude_fallback(self, query, data_context="", expert="general"):
         """Use Claude as fallback."""
