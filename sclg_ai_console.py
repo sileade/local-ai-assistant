@@ -2736,13 +2736,11 @@ class SclgAI:
         print()
 
         # ── Two-column table ──
-        # Left: 55% for logo, Right: 45% for data
-        left_w = int(w * 0.55) - 2
+        # Left: compact for logo (~35%), Right: wider for data (~65%)
+        left_w = max(28, int(w * 0.35))
         right_w = w - left_w - 3  # 3 for border chars |│|
-        if left_w < 30:
-            left_w = 30
-        if right_w < 25:
-            right_w = 25
+        if right_w < 30:
+            right_w = 30
 
         # Collect dynamic data
         dyn = self._get_dynamic_data()
