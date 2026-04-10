@@ -2823,17 +2823,17 @@ class SclgAI:
         # Collect dynamic data
         dyn = self._get_dynamic_data()
 
-        # Build left column lines (centered logo)
+        # Build left column lines (centered logo as a single block)
         logo_raw = CLAW_MINI.strip().split("\n")
-        # Find max logo line width
+        # Find max logo line width to treat as one block
         max_logo_w = max(len(line) for line in logo_raw)
+        # Calculate single offset to center the WHOLE block
+        block_pad = max(0, (left_w - 2 - max_logo_w) // 2)
         left = []
         for line in logo_raw:
-            # Center each logo line within left column
-            line_pad = (left_w - 2 - len(line)) // 2
-            if line_pad < 0:
-                line_pad = 0
-            left.append(f"{' ' * line_pad}{LOGO_CLR}{line}{C.RESET}")
+            # Pad each line to max_logo_w to preserve relative alignment, then offset
+            padded = line + ' ' * (max_logo_w - len(line))
+            left.append(f"{' ' * block_pad}{LOGO_CLR}{padded}{C.RESET}")
         left.append("")
         # Center "Welcome back ilea"
         welcome = "Welcome back ilea"
