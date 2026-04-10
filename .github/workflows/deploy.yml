@@ -1,0 +1,52 @@
+name: Deploy to Mac Mini
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'sclg_ai_console.py'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify syntax
+        run: python3 -c "import py_compile; py_compile.compile('sclg_ai_console.py', doraise=True)"
+
+      - name: Install sshpass
+        run: sudo apt-get install -y sshpass
+
+      - name: Deploy to bastion
+        env:
+          SSHPASS: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          sshpass -e scp -o StrictHostKeyChecking=no -P 2222 \
+            sclg_ai_console.py ilea@45.144.43.100:/tmp/sclg_ai_console.py
+
+      - name: Deploy to Mac Mini via bastion
+        env:
+          SSHPASS: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          sshpass -e ssh -o StrictHostKeyChecking=no -p 2222 ilea@45.144.43.100 bash -s << 'EOF'
+          export SSHPASS='${{ secrets.SSH_PASSWORD }}'
+          sshpass -e scp -o StrictHostKeyChecking=no /tmp/sclg_ai_console.py ilea@172.27.4.255:/tmp/sclg_ai_console.py
+          sshpass -e ssh -o StrictHostKeyChecking=no ilea@172.27.4.255 bash -s << 'MAC'
+          cp /tmp/sclg_ai_console.py /opt/homebrew/bin/sclg_ai_console.py 2>/dev/null || true
+          cp /tmp/sclg_ai_console.py ~/bin/sclg_ai_console.py 2>/dev/null || true
+          chmod +x /opt/homebrew/bin/sclg_ai_console.py ~/bin/sclg_ai_console.py 2>/dev/null || true
+          echo "Deployed $(python3 /opt/homebrew/bin/sclg_ai_console.py --version 2>&1) to $(hostname)"
+          MAC
+          EOF
+
+      - name: Verify deployment
+        env:
+          SSHPASS: ${{ secrets.SSH_PASSWORD }}
+        run: |
+          VERSION=$(sshpass -e ssh -o StrictHostKeyChecking=no -p 2222 ilea@45.144.43.100 bash -s << 'EOF'
+          export SSHPASS='${{ secrets.SSH_PASSWORD }}'
+          sshpass -e ssh -o StrictHostKeyChecking=no ilea@172.27.4.255 'python3 /opt/homebrew/bin/sclg_ai_console.py --version 2>&1'
+          EOF
+          )
+          echo "Deployed version: $VERSION"
