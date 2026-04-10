@@ -2715,34 +2715,60 @@ class SclgAI:
         w = get_terminal_width()
         clear_screen()
 
+        # Helper to get visible length (strip ANSI)
+        _ansi_re = re.compile(r'\033\[[^m]*m')
+        def vis_len(s):
+            return len(_ansi_re.sub('', s))
+
+        def pad_to(s, width):
+            """Pad string with spaces to reach target visible width."""
+            vl = vis_len(s)
+            return s + ' ' * max(0, width - vl)
+
         # ── Title bar ──
         title = f" Scoliologic AI v{VERSION} "
-        title_line = f"┤{title}├"
-        pad = (w - len(title_line)) // 2
-        print(f"{ACCENT}{'─' * pad}{title_line}{'─' * (w - pad - len(title_line))}{C.RESET}")
+        title_line = f"\u2524{title}\u251c"
+        tl_len = len(title) + 2
+        left_pad = (w - tl_len) // 2
+        right_pad = w - left_pad - tl_len
+        hbar = '\u2500'
+        print(f"{ACCENT}{hbar * left_pad}{title_line}{hbar * right_pad}{C.RESET}")
         print()
 
-        # ── Two-column table like Claude Code ──
-        # Left column: logo + identity, Right column: dynamic data
-        col_w = (w - 3) // 2  # -3 for border chars
-        if col_w < 30:
-            col_w = 40
+        # ── Two-column table ──
+        # Left: 55% for logo, Right: 45% for data
+        left_w = int(w * 0.55) - 2
+        right_w = w - left_w - 3  # 3 for border chars |│|
+        if left_w < 30:
+            left_w = 30
+        if right_w < 25:
+            right_w = 25
 
         # Collect dynamic data
         dyn = self._get_dynamic_data()
 
-        # Build left column lines
-        logo_lines = CLAW_MINI.strip().split("\n")
+        # Build left column lines (centered logo)
+        logo_raw = CLAW_MINI.strip().split("\n")
+        # Find max logo line width
+        max_logo_w = max(len(line) for line in logo_raw)
         left = []
-        for line in logo_lines:
-            left.append(f"{LOGO_CLR}{line}{C.RESET}")
-        left.append(f"")
-        left.append(f"{C.BOLD}Welcome back ilea{C.RESET}")
-        left.append(f"")
+        for line in logo_raw:
+            # Center each logo line within left column
+            line_pad = (left_w - 2 - len(line)) // 2
+            if line_pad < 0:
+                line_pad = 0
+            left.append(f"{' ' * line_pad}{LOGO_CLR}{line}{C.RESET}")
+        left.append("")
+        # Center "Welcome back ilea"
+        welcome = "Welcome back ilea"
+        w_pad = (left_w - 2 - len(welcome)) // 2
+        left.append(f"{' ' * max(0, w_pad)}{C.BOLD}{welcome}{C.RESET}")
+        left.append("")
 
-        # Model info
+        # Claude status
         if self.claude_ok:
-            claude_str = f"{CLAUDE_CLR}Sonnet 4{C.RESET} · API Usage Billing"
+            remaining = self.claude.remaining_today()
+            claude_str = f"{CLAUDE_CLR}Claude Sonnet 4{C.RESET} {DIM_COLOR}· {remaining}/{CLAUDE_DAILY_LIMIT} today{C.RESET}"
         else:
             claude_str = f"{WARN_CLR}Claude offline{C.RESET}"
         left.append(claude_str)
@@ -2751,32 +2777,31 @@ class SclgAI:
 
         # Build right column lines
         right = []
-        right.append(f"{ACCENT}System Info{C.RESET}")
+        right.append(f"{ACCENT}{C.BOLD}System Info{C.RESET}")
         right.append(f"{DIM_COLOR}{dyn.get('os_ver', 'macOS')} · {dyn.get('cpu', 'ARM')}{C.RESET}")
         right.append(f"{DIM_COLOR}Memory: {dyn.get('memory', '?')} · Disk: {dyn.get('disk', '?')}{C.RESET}")
-        right.append(f"")
-        right.append(f"{SYSTEM_CLR}Infrastructure{C.RESET}")
+        right.append("")
+        right.append(f"{SYSTEM_CLR}{C.BOLD}Infrastructure{C.RESET}")
         right.append(f"{DIM_COLOR}GPU Balancer: {self.model_count} models{C.RESET}")
         if dyn.get("gpu_temp"):
             right.append(f"{DIM_COLOR}GPU Temp: {dyn['gpu_temp']}{C.RESET}")
         if dyn["learner_cycles"] > 0:
-            right.append(f"{SKILL_CLR}InfraLearner: {dyn['learner_cycles']} cycles, {dyn['learner_insights']} insights{C.RESET}")
+            right.append(f"{SKILL_CLR}InfraLearner: {dyn['learner_cycles']} cycles{C.RESET}")
         else:
             right.append(f"{DIM_COLOR}InfraLearner: idle{C.RESET}")
         if dyn["anomaly_count"] > 0:
-            right.append(f"{WARN_CLR}⚠ {dyn['anomaly_count']} anomalies (24h){C.RESET}")
+            right.append(f"{WARN_CLR}\u26a0 {dyn['anomaly_count']} anomalies (24h){C.RESET}")
         else:
-            right.append(f"{SYSTEM_CLR}✓ No anomalies (24h){C.RESET}")
-        right.append(f"")
-        right.append(f"{ACCENT2}Recent activity{C.RESET}")
-        # Show last few commands from history
+            right.append(f"{SYSTEM_CLR}\u2713 No anomalies (24h){C.RESET}")
+        right.append("")
+        right.append(f"{ACCENT2}{C.BOLD}Recent activity{C.RESET}")
         try:
             if os.path.exists(HISTORY_FILE):
                 with open(HISTORY_FILE) as f:
                     hist = [l.strip() for l in f.readlines() if l.strip()][-3:]
                 if hist:
                     for h in hist:
-                        right.append(f"{DIM_COLOR}› {h[:col_w-4]}{C.RESET}")
+                        right.append(f"{DIM_COLOR}\u203a {h[:right_w-4]}{C.RESET}")
                 else:
                     right.append(f"{DIM_COLOR}No recent activity{C.RESET}")
             else:
@@ -2791,26 +2816,17 @@ class SclgAI:
         while len(right) < max_lines:
             right.append("")
 
-        # Helper to get visible length (strip ANSI)
-        import re
-        def vis_len(s):
-            return len(re.sub(r'\033\[[^m]*m', '', s))
-
         # Draw top border
-        print(f"{BORDER_CLR}┌{'─' * (col_w)}┬{'─' * (col_w)}┐{C.RESET}")
+        print(f"{BORDER_CLR}\u250c{hbar * left_w}\u252c{hbar * right_w}\u2510{C.RESET}")
 
         # Draw rows
         for i in range(max_lines):
-            l = left[i]
-            r = right[i]
-            l_vis = vis_len(l)
-            r_vis = vis_len(r)
-            l_pad = max(0, col_w - 2 - l_vis)
-            r_pad = max(0, col_w - 2 - r_vis)
-            print(f"{BORDER_CLR}│{C.RESET} {l}{' ' * l_pad}{BORDER_CLR}│{C.RESET} {r}{' ' * r_pad}{BORDER_CLR}│{C.RESET}")
+            l_str = pad_to(left[i], left_w - 2)
+            r_str = pad_to(right[i], right_w - 2)
+            print(f"{BORDER_CLR}\u2502{C.RESET} {l_str} {BORDER_CLR}\u2502{C.RESET} {r_str} {BORDER_CLR}\u2502{C.RESET}")
 
         # Draw bottom border
-        print(f"{BORDER_CLR}└{'─' * (col_w)}┴{'─' * (col_w)}┘{C.RESET}")
+        print(f"{BORDER_CLR}\u2514{hbar * left_w}\u2534{hbar * right_w}\u2518{C.RESET}")
         print()
 
     def show_status(self):
@@ -2844,8 +2860,8 @@ class SclgAI:
 
     def run(self):
         """Main interactive loop."""
+        self.check_connections()  # Check BEFORE banner so model_count is populated
         self.show_banner()
-        self.check_connections()
         self.show_status()
         draw_hline()
 
