@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔═══════════════════════════════════════════════════════════╗
-║  Scoliologic AI Console (sclg-ai) v4.5.0                 ║
+║  Scoliologic AI Console (sclg-ai) v4.6.0                 ║
 ║  Autonomous DevOps/SysAdmin Agent                        ║
 ║  Execute first, explain later — like Claude Code          ║
 ║                                                           ║
@@ -83,7 +83,7 @@ SKILL_CLR   = C.rgb(120, 220, 200)
 
 # ── Configuration ───────────────────────────────────────────────────
 
-VERSION = "4.5.0"
+VERSION = "4.6.0"
 APP_NAME = "Scoliologic AI"
 
 GPU_BALANCER_URL = "http://10.0.0.229:11440"
@@ -529,7 +529,7 @@ class ResponseCleaner:
             return text
 
         # Method 1: Find any substring of 2-30 chars that repeats 5+ times consecutively
-        loop_pat = re.compile(r'(.{2,30?}){4,}', re.DOTALL)
+        loop_pat = re.compile(r'(.{2,30?}){4,}', re.DOTALL)
         match = loop_pat.search(text)
         if match:
             cut_pos = match.start()
@@ -550,6 +550,19 @@ class ResponseCleaner:
                     if first_occ > 50:
                         return text[:first_occ].rstrip() + '\n\n[... повторяющийся вывод обрезан ...]'
                     return '[Ответ содержал только повторяющиеся данные и был обрезан]'
+
+        # Method 3: Detect repeated lines (same line appears 4+ times)
+        lines = text.split('\n')
+        if len(lines) > 10:
+            from collections import Counter
+            line_counts = Counter(line.strip() for line in lines if line.strip())
+            for line_text, count in line_counts.most_common(3):
+                if count >= 4 and len(line_text) > 3:
+                    # Find first occurrence and keep text up to 2nd occurrence
+                    first_idx = next(i for i, l in enumerate(lines) if l.strip() == line_text)
+                    second_idx = next(i for i, l in enumerate(lines) if l.strip() == line_text and i > first_idx)
+                    if second_idx > 3:
+                        return '\n'.join(lines[:second_idx]).rstrip() + '\n\n[... повторяющийся вывод обрезан ...]'
 
         return text
 
@@ -1050,20 +1063,20 @@ CLAW_MINI = [
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ANIMATED SPINNER — Visual feedback while AI is thinking
-# Shows braille animation + elapsed time + current action
+# ANIMATED SPINNER — Claude Code style visual feedback
+# Braille dots spinner + elapsed time + substatus
 # ══════════════════════════════════════════════════════════════════════
 
 class Spinner:
-    """Animated spinner with timer for long-running operations."""
+    """Claude Code style animated spinner with Braille dots."""
 
-    BRAILLE = ["⣾", "⣽", "⣻", "⢿", "⣿", "⣟", "⣯", "⣷"]
-    DOTS    = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    # Claude Code uses these exact Braille frames
+    DOTS = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
-    def __init__(self, message="Thinking", color=ACCENT2, style="braille"):
+    def __init__(self, message="Thinking", color=ACCENT2, style="dots"):
         self.message = message
         self.color = color
-        self.frames = self.BRAILLE if style == "braille" else self.DOTS
+        self.frames = self.DOTS
         self._running = False
         self._thread = None
         self._start_time = 0
@@ -1071,7 +1084,7 @@ class Spinner:
         self._lock = threading.Lock()
 
     def _animate(self):
-        """Animation loop running in background thread."""
+        """Animation loop — Claude Code style: ⠋ Message... 5s  substatus"""
         idx = 0
         while self._running:
             elapsed = time.time() - self._start_time
@@ -1079,18 +1092,20 @@ class Spinner:
             with self._lock:
                 sub = self._substatus
 
-            # Build status line
-            status = f"\r  {self.color}{frame} {self.message}... {elapsed:.0f}s{C.RESET}"
+            # Claude Code style: spinner char + message + elapsed
+            status = f"\r  {self.color}{frame}{C.RESET} {C.BOLD}{self.message}{C.RESET}"
+            if elapsed >= 1:
+                status += f" {DIM_COLOR}{elapsed:.0f}s{C.RESET}"
             if sub:
                 status += f"  {DIM_COLOR}{sub}{C.RESET}"
 
             # Pad to clear previous line
-            status += " " * 20
+            status += " " * 30
 
             sys.stdout.write(status)
             sys.stdout.flush()
             idx += 1
-            time.sleep(0.12)
+            time.sleep(0.08)  # Slightly faster for smoother animation
 
     def update(self, substatus):
         """Update substatus text (e.g., model name, step)."""
@@ -1106,7 +1121,7 @@ class Spinner:
         return self
 
     def stop(self, final_message=""):
-        """Stop the spinner and clear the line."""
+        """Stop the spinner and show final status like Claude Code."""
         self._running = False
         if self._thread:
             self._thread.join(timeout=1)
@@ -1115,7 +1130,7 @@ class Spinner:
         sys.stdout.write(f"\r{' ' * (get_terminal_width())}\r")
         sys.stdout.flush()
         if final_message:
-            print(f"  {SYSTEM_CLR}{final_message} ({elapsed:.1f}s){C.RESET}")
+            print(f"  {SYSTEM_CLR}✓ {final_message}{C.RESET} {DIM_COLOR}({elapsed:.1f}s){C.RESET}")
 
     def __enter__(self):
         return self.start()
@@ -1124,31 +1139,174 @@ class Spinner:
         self.stop()
 
 
-class ProgressBar:
-    """Simple progress indicator for multi-step operations."""
+class CommandRenderer:
+    """Claude Code style command execution renderer.
 
-    def __init__(self, total, label="Progress", color=TOOL_CLR):
+    Shows commands as they execute:
+      ● Bash(nmap -sn 172.27.4.0/24)
+        ✓ Done (2.3s)
+      ● Bash(ping -c 1 172.27.4.1)
+        ✓ Done (0.1s)
+    """
+
+    @staticmethod
+    def show_start(cmd, max_len=70):
+        """Show command start: ● Bash(cmd...)"""
+        cmd_display = cmd.split('|')[0].strip()
+        if len(cmd_display) > max_len:
+            cmd_display = cmd_display[:max_len-3] + '...'
+        print(f"  {TOOL_CLR}●{C.RESET} {C.BOLD}Bash{C.RESET}({DIM_COLOR}{cmd_display}{C.RESET})")
+
+    @staticmethod
+    def show_done(elapsed, success=True):
+        """Show command result: ✓ Done (0.1s) or ✗ Failed (0.1s)"""
+        if success:
+            print(f"    {SYSTEM_CLR}✓{C.RESET} {DIM_COLOR}Done ({elapsed:.1f}s){C.RESET}")
+        else:
+            print(f"    {ERROR_CLR}✗{C.RESET} {DIM_COLOR}Failed ({elapsed:.1f}s){C.RESET}")
+
+    @staticmethod
+    def show_timeout(timeout_sec):
+        """Show timeout: ✗ Timeout (30s)"""
+        print(f"    {ERROR_CLR}✗{C.RESET} {DIM_COLOR}Timeout ({timeout_sec}s){C.RESET}")
+
+    @staticmethod
+    def show_output_preview(output, max_lines=3):
+        """Show collapsed output preview if output is long."""
+        if not output or not output.strip():
+            return
+        lines = output.strip().split('\n')
+        if len(lines) <= max_lines:
+            return  # Short output — will be sent to AI, no need to preview
+        # Show first few lines + count
+        for line in lines[:max_lines]:
+            trimmed = line[:100] + ('...' if len(line) > 100 else '')
+            print(f"    {DIM_COLOR}│ {trimmed}{C.RESET}")
+        remaining = len(lines) - max_lines
+        print(f"    {DIM_COLOR}└ ... {remaining} more lines{C.RESET}")
+
+
+class ProgressTracker:
+    """Claude Code style progress for multi-command execution.
+
+    Shows: ⚡ Collecting data [2/5]
+    Then each command as ● Bash(cmd) → ✓ Done
+    """
+
+    def __init__(self, total, label="Collecting data"):
         self.total = total
         self.current = 0
         self.label = label
-        self.color = color
+        self.cmd_renderer = CommandRenderer()
+
+    def next_command(self, cmd):
+        """Start next command — show header + command."""
+        self.current += 1
+        # Show progress header on first command only
+        if self.current == 1:
+            print(f"  {TOOL_CLR}⚡{C.RESET} {C.BOLD}{self.label}{C.RESET} {DIM_COLOR}[0/{self.total}]{C.RESET}")
+        self.cmd_renderer.show_start(cmd)
+
+    def command_done(self, elapsed, success=True, output=""):
+        """Mark command as done."""
+        self.cmd_renderer.show_done(elapsed, success)
+        # Show output preview for long outputs
+        if output and len(output.strip().split('\n')) > 5:
+            self.cmd_renderer.show_output_preview(output)
+
+    def command_timeout(self, timeout_sec):
+        """Mark command as timed out."""
+        self.cmd_renderer.show_timeout(timeout_sec)
+
+    def finish(self, collected, total):
+        """Show final collection summary."""
+        print(f"  {SYSTEM_CLR}✓{C.RESET} {DIM_COLOR}Collected {collected}/{total} data sources{C.RESET}")
+
+
+class TypewriterEffect:
+    """Smooth text appearance effect for AI responses.
+
+    Outputs text line-by-line with a small delay for visual polish.
+    Code blocks and tables are printed instantly.
+    """
+
+    # Delay between lines (seconds)
+    LINE_DELAY = 0.015
+    # Delay between chars for short important lines
+    CHAR_DELAY = 0.008
+    # Max chars for char-by-char mode
+    CHAR_MODE_MAX = 80
+
+    @classmethod
+    def print(cls, text, instant_threshold=200):
+        """Print text with typewriter effect.
+
+        Args:
+            text: Formatted text to display
+            instant_threshold: If text > this many lines, print instantly
+        """
+        if not text:
+            return
+
+        lines = text.split('\n')
+
+        # Very long output — print instantly
+        if len(lines) > instant_threshold:
+            print(text)
+            return
+
+        in_code_block = False
+        for i, line in enumerate(lines):
+            # Detect code block boundaries (already formatted with box chars)
+            if '\u250c' in line or '```' in line:
+                in_code_block = True
+            if '\u2514' in line or (in_code_block and '```' in line and i > 0):
+                # Print code block line and exit code mode
+                print(line)
+                in_code_block = False
+                continue
+
+            if in_code_block:
+                # Code blocks print instantly
+                print(line)
+                continue
+
+            # Table rows (contain │) — print with minimal delay
+            if '│' in line or '┌' in line or '└' in line or '├' in line:
+                print(line)
+                time.sleep(cls.LINE_DELAY * 0.3)
+                continue
+
+            # Empty lines — instant
+            if not line.strip():
+                print(line)
+                continue
+
+            # Section headers — slight pause before for emphasis
+            if '═══' in line or '━━━' in line:
+                time.sleep(cls.LINE_DELAY * 2)
+                print(line)
+                time.sleep(cls.LINE_DELAY)
+                continue
+
+            # Regular lines — line-by-line with delay
+            print(line)
+            time.sleep(cls.LINE_DELAY)
+
+
+# Legacy compatibility alias
+class ProgressBar(ProgressTracker):
+    """Backward-compatible wrapper around ProgressTracker."""
+
+    def __init__(self, total, label="Progress", color=TOOL_CLR):
+        super().__init__(total, label)
 
     def update(self, step_name=""):
-        """Update progress."""
-        self.current += 1
-        pct = int(self.current / self.total * 100) if self.total > 0 else 0
-        bar_width = 20
-        filled = int(bar_width * self.current / self.total) if self.total > 0 else 0
-        bar = "█" * filled + "░" * (bar_width - filled)
-        status = f"\r  {self.color}{self.label} [{bar}] {pct}%{C.RESET}"
-        if step_name:
-            status += f"  {DIM_COLOR}{step_name}{C.RESET}"
-        status += " " * 10
-        sys.stdout.write(status)
-        sys.stdout.flush()
+        """Legacy update method — maps to next_command."""
+        self.next_command(step_name or "...")
 
     def finish(self, message=""):
-        """Complete the progress bar."""
+        """Legacy finish method."""
         sys.stdout.write(f"\r{' ' * get_terminal_width()}\r")
         sys.stdout.flush()
         if message:
@@ -1207,6 +1365,25 @@ class OllamaClient:
         # Return first available
         return available[0] if available else None
 
+    # Model-specific stop tokens to prevent garbage generation
+    GEMMA_EXTRA_STOPS = ["\n\n\n", "```\n\n", "<end_of_turn>", "<start_of_turn>"]
+    BASE_STOPS = [
+        "<|endoftext|>", "<|im_start|>", "<|im_end|>",
+        "<|end|>", "</s>", "<|assistant|>", "<|user|>",
+        "\nUser:", "\nuser:", "\nHuman:", "\nПользователь:",
+        "\nAssistant:", "\nassistant:",
+    ]
+
+    def _get_stop_tokens(self, model):
+        """Get stop tokens for a specific model."""
+        stops = list(self.BASE_STOPS)
+        model_low = model.lower()
+        if "gemma" in model_low:
+            stops.extend(self.GEMMA_EXTRA_STOPS)
+        if "deepseek" in model_low:
+            stops.append("<│end│>")
+        return stops
+
     def generate(self, model, prompt, system="", temperature=0.5, max_tokens=2048, stream=False, retries=2):
         """Generate response from Ollama with retry logic."""
         payload = {
@@ -1217,9 +1394,8 @@ class OllamaClient:
             "options": {
                 "temperature": temperature,
                 "num_predict": max_tokens,
-                "stop": ["<|endoftext|>", "<|im_start|>", "<|im_end|>",
-                         "<|end|>", "</s>", "<|assistant|>", "<|user|>",
-                         "\nUser:", "\nuser:", "\nHuman:", "\nПользователь:"],
+                "stop": self._get_stop_tokens(model),
+                "repeat_penalty": 1.15,
             }
         }
 
@@ -1269,9 +1445,8 @@ class OllamaClient:
             "options": {
                 "temperature": temperature,
                 "num_predict": max_tokens,
-                "stop": ["<|endoftext|>", "<|im_start|>", "<|im_end|>",
-                         "<|end|>", "</s>", "<|assistant|>", "<|user|>",
-                         "\nUser:", "\nuser:", "\nHuman:", "\nПользователь:"],
+                "stop": self._get_stop_tokens(model),
+                "repeat_penalty": 1.15,
             }
         }
 
@@ -1681,14 +1856,14 @@ class SmartExecutor:
         ]
 
     def execute(self, commands, timeout=30):
-        """Execute commands and collect results with progress indication."""
+        """Execute commands with Claude Code style visual feedback."""
         results = []
         total = len(commands)
-        progress = ProgressBar(total, label="Collecting data", color=TOOL_CLR)
+        tracker = ProgressTracker(total, label="Collecting data")
 
         for i, cmd in enumerate(commands):
-            cmd_short = cmd.split('|')[0].strip()[:50]
-            progress.update(cmd_short)
+            cmd_short = cmd.split('|')[0].strip()[:70]
+            tracker.next_command(cmd)
 
             try:
                 t0 = time.time()
@@ -1700,14 +1875,18 @@ class SmartExecutor:
                 output = proc.stdout.strip()
                 if proc.stderr.strip() and not output:
                     output = proc.stderr.strip()
+                success = proc.returncode == 0
+                tracker.command_done(dt, success=success, output=output)
                 if output:
                     results.append(f"$ {cmd_short}...\n{output}")
             except subprocess.TimeoutExpired:
+                tracker.command_timeout(timeout)
                 results.append(f"$ {cmd[:40]}... [TIMEOUT after {timeout}s]")
             except Exception as e:
+                tracker.command_done(0, success=False)
                 results.append(f"$ {cmd[:40]}... [ERROR: {e}]")
 
-        progress.finish(f"Collected {len(results)}/{total} data sources")
+        tracker.finish(len(results), total)
         return "\n\n".join(results) if results else ""
 
     def is_sysadmin_query(self, query):
@@ -2096,40 +2275,40 @@ class SclgAI:
     # ── Connection Check ────────────────────────────────────────────
 
     def check_connections(self):
-        """Check all connections on startup with animated feedback."""
+        """Check all connections on startup with Claude Code style feedback."""
         # Check Ollama/GPU Balancer
-        spinner = Spinner("Connecting to GPU Balancer", color=TOOL_CLR, style="dots")
+        spinner = Spinner("Connecting to GPU Balancer", color=TOOL_CLR)
         spinner.start()
         self.ollama_ok = self.ollama.check_connection()
         if self.ollama_ok:
             self.model_count = len(self.ollama.available_models)
-            spinner.stop(f"✓ GPU Balancer: {self.model_count} models")
+            spinner.stop(f"GPU Balancer: {self.model_count} models")
         else:
             spinner.stop()
             print(f"  {ERROR_CLR}✗ GPU Balancer offline{C.RESET}")
 
         # Check Claude
-        spinner2 = Spinner("Checking Claude API", color=CLAUDE_CLR, style="dots")
+        spinner2 = Spinner("Checking Claude API", color=CLAUDE_CLR)
         spinner2.start()
         self.claude_ok = self.claude.test_connection()
         if self.claude_ok:
             remaining = self.claude.remaining_today()
-            spinner2.stop(f"✓ Claude OK ({remaining}/{CLAUDE_DAILY_LIMIT} today)")
+            spinner2.stop(f"Claude OK ({remaining}/{CLAUDE_DAILY_LIMIT} today)")
         else:
             spinner2.stop()
             print(f"  {WARN_CLR}⚠ Claude unavailable{C.RESET}")
 
         # Check InfraLearner & Grafana
-        spinner3 = Spinner("Checking Grafana & InfraLearner", color=SKILL_CLR, style="dots")
+        spinner3 = Spinner("Checking Grafana & InfraLearner", color=SKILL_CLR)
         spinner3.start()
         learner_status = self.learner.get_learner_status()
         grafana_ok = bool(self.learner.get_dashboards())
         if learner_status.get("running"):
             cycles = learner_status.get("total_cycles", 0)
             insights = learner_status.get("total_insights_generated", 0)
-            spinner3.stop(f"✓ InfraLearner: {cycles} cycles, {insights} insights")
+            spinner3.stop(f"InfraLearner: {cycles} cycles, {insights} insights")
         elif grafana_ok:
-            spinner3.stop(f"✓ Grafana OK, InfraLearner not running")
+            spinner3.stop(f"Grafana OK, InfraLearner not running")
         else:
             spinner3.stop()
             print(f"  {DIM_COLOR}○ Grafana/InfraLearner not available{C.RESET}")
@@ -2248,28 +2427,45 @@ class SclgAI:
             return self._execute_direct_command(query)
 
         # Step 3: Smart Execute — run commands FIRST if pattern matches
-        # For short queries, try to resolve context from conversation history
+        # For short queries, resolve context from conversation history
         enriched_query = query
         if len(query.split()) <= 5 and self.conversation:
-            # Short query — check if previous messages give context
+            # Short/ambiguous query — enrich with conversation context
+            # Detect continuation words
+            continuation_words = [
+                "анализ", "подробнее", "ещё", "еще", "покажи", "давай",
+                "нужен", "нужна", "продолжи", "повтори", "расскажи",
+                "что с этим", "как исправить", "почини",
+                "more", "details", "continue", "analyze", "fix",
+            ]
+            q_low = query.lower()
+            is_continuation = any(w in q_low for w in continuation_words)
+
             last_topics = []
-            for msg in self.conversation[-4:]:
+            last_assistant = ""
+            for msg in self.conversation[-6:]:
                 if msg.get("role") == "user":
                     last_topics.append(msg.get("content", ""))
+                elif msg.get("role") == "assistant":
+                    last_assistant = msg.get("content", "")[:300]
+
             if last_topics:
-                enriched_query = f"{query} (контекст: {' '.join(last_topics[-2:])})"
+                # Include both user topics and last assistant response for better context
+                ctx_parts = last_topics[-2:]
+                if is_continuation and last_assistant:
+                    # For continuation queries, include assistant's last response topic
+                    ctx_parts.append(f"последний_ответ: {last_assistant[:150]}")
+                enriched_query = f"{query} (контекст: {' '.join(ctx_parts)})"
 
         data_context = ""
         commands, category = self.executor.match(enriched_query)
         if commands:
-            print(f"  {TOOL_CLR}⚡ Collecting system data...{C.RESET}")
             data_context = self.executor.execute(commands)
             if category:
                 expert = category
 
         # Step 4: If sysadmin query but no pattern matched, try generic commands
         if not data_context and self.executor.is_sysadmin_query(query):
-            print(f"  {TOOL_CLR}⚡ Running system check...{C.RESET}")
             # Build context-aware generic commands based on query keywords
             generic_cmds = ["hostname && uname -a"]
             q_low = query.lower()
@@ -2367,10 +2563,10 @@ class SclgAI:
         return any(query.strip().startswith(p) for p in cmd_prefixes)
 
     def _execute_direct_command(self, query):
-        """Execute a direct shell command with visual feedback."""
+        """Execute a direct shell command with Claude Code style feedback."""
         cmd = query.strip()
-        cmd_display = cmd[:60] + ('...' if len(cmd) > 60 else '')
-        print(f"  {TOOL_CLR}● Bash({cmd_display}){C.RESET}", end="", flush=True)
+        renderer = CommandRenderer()
+        renderer.show_start(cmd)
 
         try:
             t0 = time.time()
@@ -2381,17 +2577,19 @@ class SclgAI:
             output = result.stdout
             if result.stderr:
                 output += f"\n{result.stderr}" if output else result.stderr
-            if result.returncode != 0:
-                print(f"  {ERROR_CLR}✗ {dt:.1f}s{C.RESET}")
+            success = result.returncode == 0
+            renderer.show_done(dt, success=success)
+            if not success:
                 output = f"Exit code {result.returncode}\n{output}"
-            else:
-                print(f"  {SYSTEM_CLR}✓ {dt:.1f}s{C.RESET}")
+            # Show output preview for long results
+            if output and len(output.strip().split('\n')) > 5:
+                renderer.show_output_preview(output)
             return output.strip() if output.strip() else "(no output)"
         except subprocess.TimeoutExpired:
-            print(f"  {ERROR_CLR}✗ timeout{C.RESET}")
+            renderer.show_timeout(30)
             return "[TIMEOUT after 30s]"
         except Exception as e:
-            print(f"  {ERROR_CLR}✗ error{C.RESET}")
+            renderer.show_done(0, success=False)
             return f"[ERROR: {e}]"
 
     def _get_ai_response(self, query, expert, data_context="", spinner=None):
@@ -2515,22 +2713,21 @@ class SclgAI:
         return response
 
     def _process_agent_commands(self, response):
-        """Process <cmd>...</cmd> tags in AI response — execute commands."""
+        """Process <cmd>...</cmd> tags in AI response — execute with Claude Code style."""
         cmd_pattern = re.compile(r'<cmd>(.*?)</cmd>', re.DOTALL)
         matches = cmd_pattern.findall(response)
 
         if not matches:
             return response
 
-        # Execute each command and append results
+        renderer = CommandRenderer()
         result_text = response
         for cmd in matches:
             cmd = cmd.strip()
             if not cmd:
                 continue
 
-            cmd_display = cmd[:60] + ('...' if len(cmd) > 60 else '')
-            print(f"  {TOOL_CLR}● Bash({cmd_display}){C.RESET}", end="", flush=True)
+            renderer.show_start(cmd)
 
             try:
                 t0 = time.time()
@@ -2542,10 +2739,10 @@ class SclgAI:
                 if proc.stderr.strip():
                     output += f"\n{proc.stderr.strip()}" if output else proc.stderr.strip()
 
-                if proc.returncode == 0:
-                    print(f"  {SYSTEM_CLR}✓ {dt:.1f}s{C.RESET}")
-                else:
-                    print(f"  {WARN_CLR}⚠ exit {proc.returncode} {dt:.1f}s{C.RESET}")
+                success = proc.returncode == 0
+                renderer.show_done(dt, success=success)
+                if output and len(output.split('\n')) > 5:
+                    renderer.show_output_preview(output)
 
                 # Replace the <cmd> tag with the output
                 tag = f"<cmd>{cmd}</cmd>"
@@ -2553,11 +2750,11 @@ class SclgAI:
                 result_text = result_text.replace(tag, replacement, 1)
 
             except subprocess.TimeoutExpired:
-                print(f"  {ERROR_CLR}✗ timeout{C.RESET}")
+                renderer.show_timeout(30)
                 tag = f"<cmd>{cmd}</cmd>"
                 result_text = result_text.replace(tag, f"```\n$ {cmd}\n[TIMEOUT]\n```", 1)
             except Exception as e:
-                print(f"  {ERROR_CLR}✗ error{C.RESET}")
+                renderer.show_done(0, success=False)
                 tag = f"<cmd>{cmd}</cmd>"
                 result_text = result_text.replace(tag, f"```\n$ {cmd}\n[ERROR: {e}]\n```", 1)
 
@@ -2749,7 +2946,9 @@ class SclgAI:
         claude_sp.stop("Claude responded")
         response = self.cleaner.clean(response)
         formatted = self.formatter.format(response)
-        print(f"\n{formatted}{C.RESET}")
+        print()  # Blank line before response
+        TypewriterEffect.print(formatted)
+        print(C.RESET, end="")
 
     def _show_knowledge(self, query=""):
         """Show learned infrastructure knowledge."""
@@ -3111,11 +3310,13 @@ class SclgAI:
 
                 elapsed = time.time() - start_time
 
-                # Display response (formatted like Claude Code)
+                # Display response with typewriter effect (Claude Code style)
                 formatted = self.formatter.format(response)
-                print(f"\n{formatted}{C.RESET}")
+                print()  # Blank line before response
+                TypewriterEffect.print(formatted)
+                print(C.RESET, end="")  # Ensure color reset
 
-                # Show metadata
+                # Show metadata footer (Claude Code style)
                 model_str = self.current_model or "?"
                 if ":" in model_str:
                     model_str = model_str.split(":")[0]
