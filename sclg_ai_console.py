@@ -28,6 +28,7 @@ import urllib.error
 import readline
 import socket
 import ipaddress
+import ssl
 import threading
 import hashlib
 from datetime import datetime
@@ -2890,8 +2891,6 @@ class SSHManager:
 # INFRA LEARNER BRIDGE — Background Self-Learning
 # ══════════════════════════════════════════════════════════════════════
 
-import ssl as _ssl
-
 class InfraLearnerBridge:
     """Bridge to InfraLearner knowledge base for use in sclg-ai.
     
@@ -2902,9 +2901,9 @@ class InfraLearnerBridge:
 
     def __init__(self):
         self.enabled = os.path.isdir(KNOWLEDGE_DIR)
-        self._ssl_ctx = _ssl.create_default_context()
+        self._ssl_ctx = ssl.create_default_context()
         self._ssl_ctx.check_hostname = False
-        self._ssl_ctx.verify_mode = _ssl.CERT_NONE
+        self._ssl_ctx.verify_mode = ssl.CERT_NONE
         self._grafana_headers = {
             "Authorization": f"Bearer {GRAFANA_TOKEN}",
             "Content-Type": "application/json"
@@ -4487,9 +4486,9 @@ DO NOT say 'I don't have access' — the data is RIGHT HERE. DO NOT suggest curl
                 query = 'nvidia_smi_temperature_gpu'
                 url = f"{GRAFANA_URL}/api/datasources/proxy/uid/{PROMETHEUS_DS_UID}/api/v1/query?query={query}"
                 req = urllib.request.Request(url, headers={"Authorization": f"Bearer {GRAFANA_TOKEN}"})
-                ctx = _ssl.create_default_context()
+                ctx = ssl.create_default_context()
                 ctx.check_hostname = False
-                ctx.verify_mode = _ssl.CERT_NONE
+                ctx.verify_mode = ssl.CERT_NONE
                 with urllib.request.urlopen(req, timeout=3, context=ctx) as resp:
                     result = json.loads(resp.read().decode())
                     gpus = result.get("data", {}).get("result", [])
