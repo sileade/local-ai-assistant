@@ -84,7 +84,7 @@ SKILL_CLR   = C.rgb(120, 220, 200)
 
 # ── Configuration ───────────────────────────────────────────────────
 
-VERSION = "5.0.0"
+VERSION = "5.0.1"
 APP_NAME = "Scoliologic AI"
 
 GPU_BALANCER_URL = "http://10.0.0.229:11440"
@@ -1150,12 +1150,31 @@ class CommandRenderer:
         ✓ Done (0.1s)
     """
 
-    @staticmethod
-    def show_start(cmd, max_len=70):
-        """Show command start: ● Bash(cmd...)"""
+    # Sensitive patterns to mask in command display
+    _MASK_PATTERNS = [
+        re.compile(r'(Authorization:\s*Bearer\s+)([A-Za-z0-9_.\-]{6})[A-Za-z0-9_.\-]+', re.IGNORECASE),
+        re.compile(r'(-H\s+["\']Authorization:\s*Bearer\s+)([A-Za-z0-9_.\-]{6})[A-Za-z0-9_.\-]+', re.IGNORECASE),
+        re.compile(r'(token[=:\s]+)([A-Za-z0-9_.\-]{4})[A-Za-z0-9_.\-]{8,}', re.IGNORECASE),
+        re.compile(r'(password[=:\s]+)([^\s]{2})[^\s]{4,}', re.IGNORECASE),
+        re.compile(r'(api[_-]?key[=:\s]+)([A-Za-z0-9]{4})[A-Za-z0-9]{8,}', re.IGNORECASE),
+        re.compile(r'(sshpass\s+-p\s+)([^\s]{2})[^\s]+', re.IGNORECASE),
+    ]
+
+    @classmethod
+    def _mask_sensitive(cls, text):
+        """Mask sensitive data (API keys, tokens, passwords) in display text."""
+        result = text
+        for pattern in cls._MASK_PATTERNS:
+            result = pattern.sub(r'\1\2***', result)
+        return result
+
+    @classmethod
+    def show_start(cls, cmd, max_len=70):
+        """Show command start: ● Bash(cmd...) with sensitive data masked."""
         cmd_display = cmd.split('|')[0].strip()
         if len(cmd_display) > max_len:
             cmd_display = cmd_display[:max_len-3] + '...'
+        cmd_display = cls._mask_sensitive(cmd_display)
         print(f"  {TOOL_CLR}●{C.RESET} {C.BOLD}Bash{C.RESET}({DIM_COLOR}{cmd_display}{C.RESET})")
 
     @staticmethod
@@ -1744,18 +1763,39 @@ class StreamRenderer:
     - Graceful interruption (Ctrl+C)
     """
 
+    # Tags to suppress from streaming output (never shown to user)
+    _SUPPRESS_TAGS = [
+        ("<think>", "</think>"),
+        ("<reflection>", "</reflection>"),
+        ("<reasoning>", "</reasoning>"),
+    ]
+
+    # Sensitive patterns to mask in output (API keys, tokens, passwords)
+    _SENSITIVE_PATTERNS = [
+        re.compile(r'(Authorization:\s*Bearer\s+)([A-Za-z0-9_.\-]{8})[A-Za-z0-9_.\-]+', re.IGNORECASE),
+        re.compile(r'(token[=:\s]+)([A-Za-z0-9_.\-]{4})[A-Za-z0-9_.\-]{8,}', re.IGNORECASE),
+        re.compile(r'(password[=:\s]+)([^\s]{2})[^\s]{4,}', re.IGNORECASE),
+        re.compile(r'(api[_-]?key[=:\s]+)([A-Za-z0-9]{4})[A-Za-z0-9]{8,}', re.IGNORECASE),
+    ]
+
     def __init__(self, formatter=None):
         self.formatter = formatter
         self._buffer = ""
+        self._display_buffer = ""  # What was actually shown to user
         self._line_buffer = ""
         self._in_code_block = False
         self._in_tool_call = False
         self._tool_buffer = ""
+        self._in_suppress = False  # Inside <think> or similar suppressed tag
+        self._suppress_buffer = ""
+        self._suppress_end_tag = ""
         self._interrupted = False
         self._token_count = 0
 
     def feed(self, token):
         """Feed a single token from the stream.
+
+        v5.0.1: Filters out <think> blocks and sensitive data in real-time.
 
         Returns:
             None normally, or a string if a complete tool call was detected.
@@ -1764,22 +1804,49 @@ class StreamRenderer:
             return None
 
         self._buffer += token
-        self._line_buffer += token
         self._token_count += 1
+
+        # ── Suppressed tag handling (<think>, <reflection>, etc.) ──
+        if self._in_suppress:
+            self._suppress_buffer += token
+            if self._suppress_end_tag in self._suppress_buffer:
+                # End of suppressed block — discard everything
+                # Check if there's content after the closing tag
+                end_idx = self._suppress_buffer.find(self._suppress_end_tag)
+                after = self._suppress_buffer[end_idx + len(self._suppress_end_tag):]
+                self._in_suppress = False
+                self._suppress_buffer = ""
+                self._suppress_end_tag = ""
+                # Feed any content after the closing tag
+                if after:
+                    return self.feed(after)
+            return None
+
+        self._line_buffer += token
+
+        # Check for suppressed tag start
+        for open_tag, close_tag in self._SUPPRESS_TAGS:
+            if open_tag in self._line_buffer:
+                self._in_suppress = True
+                self._suppress_end_tag = close_tag
+                # Print everything before the tag
+                idx = self._line_buffer.find(open_tag)
+                before = self._line_buffer[:idx]
+                if before:
+                    self._write_safe(before)
+                self._suppress_buffer = self._line_buffer[idx:]
+                self._line_buffer = ""
+                return None
 
         # Check for tool call start
         if '<tool ' in self._line_buffer or '<cmd>' in self._line_buffer:
             self._in_tool_call = True
-            # Don't print tool calls — collect them silently
-            # Find the start of the tool tag
             for tag in ['<tool ', '<cmd>']:
                 idx = self._line_buffer.find(tag)
                 if idx >= 0:
-                    # Print everything before the tag
                     before = self._line_buffer[:idx]
                     if before:
-                        sys.stdout.write(before)
-                        sys.stdout.flush()
+                        self._write_safe(before)
                     self._tool_buffer = self._line_buffer[idx:]
                     self._line_buffer = ""
                     return None
@@ -1788,28 +1855,34 @@ class StreamRenderer:
         if self._in_tool_call:
             self._tool_buffer += token
             self._line_buffer = ""
-            # Check if tool call is complete
             if '</tool>' in self._tool_buffer or '</cmd>' in self._tool_buffer:
                 self._in_tool_call = False
                 tool_text = self._tool_buffer
                 self._tool_buffer = ""
-                return tool_text  # Signal: tool call detected
+                return tool_text
             return None
 
         # Regular streaming output
-        # Check for code block boundaries
         if '```' in self._line_buffer:
             self._in_code_block = not self._in_code_block
 
-        # Print token immediately
-        sys.stdout.write(token)
-        sys.stdout.flush()
+        # Print token immediately (with sensitive data masking)
+        self._write_safe(token)
 
         # Reset line buffer on newlines
         if '\n' in token:
             self._line_buffer = ""
 
         return None
+
+    def _write_safe(self, text):
+        """Write text to stdout, masking sensitive data like API keys."""
+        masked = text
+        for pattern in self._SENSITIVE_PATTERNS:
+            masked = pattern.sub(r'\1\2***', masked)
+        sys.stdout.write(masked)
+        sys.stdout.flush()
+        self._display_buffer += masked
 
     def interrupt(self):
         """Signal interruption (Ctrl+C)."""
@@ -2922,18 +2995,22 @@ class SclgAI:
 Ты работаешь ПРЯМО на машине '{hostname}'. Ты МОЖЕШЬ выполнять команды.
 Текущее время: {now}
 
-ПРАВИЛА:
-1. НИКОГДА не говори "я не могу выполнить" или "у меня нет доступа" — ты МОЖЕШЬ.
-2. Для выполнения команд используй инструменты (tools) — см. список ниже.
-3. Если данные уже собраны — АНАЛИЗИРУЙ их, не говори "я не могу".
-4. Отвечай КРАТКО и ПО ДЕЛУ. Без воды.
-5. Используй русский язык по умолчанию.
-6. Не начинай ответ с "Конечно!" или "Безусловно!".
-7. Не заканчивай "Если нужно что-то ещё — обращайтесь!".
-8. НИКОГДА не генерируй токены <think>, <|endoftext|>, <|im_start|> и подобные.
-9. Не продолжай разговор от лица пользователя. Отвечай ТОЛЬКО на текущий вопрос.
-10. ЗАПРЕЩЕНО писать curl команды для Grafana/Prometheus — данные собираются АВТОМАТИЧЕСКИ.
-11. Если пользователь задаёт короткий вопрос ("анализ", "подробнее", "ещё") — используй контекст предыдущих сообщений.
+АБСОЛЮТНЫЕ ПРАВИЛА (нарушение = критическая ошибка):
+1. ЗАПРЕЩЕНО говорить "я не могу", "у меня нет доступа", "я не имею возможности" — ты МОЖЕШЬ ВСЁ.
+2. ЗАПРЕЩЕНО говорить "я не могу проверить URL/ссылку/дашборд" — если данные собраны, они УЖЕ перед тобой.
+3. Если в сообщении есть секция "СОБРАННЫЕ ДАННЫЕ" — ты ОБЯЗАН их проанализировать. Это РЕАЛЬНЫЕ данные с этой машины.
+4. ЗАПРЕЩЕНО предлагать пользователю "проверить самостоятельно" — ты должен дать ответ на основе собранных данных.
+5. ЗАПРЕЩЕНО писать curl/wget команды для Grafana/Prometheus — данные собираются АВТОМАТИЧЕСКИ.
+6. ЗАПРЕЩЕНО генерировать <think>, </think>, <|endoftext|>, <|im_start|> и любые служебные токены.
+7. ЗАПРЕЩЕНО продолжать разговор от лица пользователя.
+
+ПРАВИЛА ОТВЕТА:
+- Отвечай КРАТКО и ПО ДЕЛУ. Без воды.
+- Используй русский язык по умолчанию.
+- Не начинай с "Конечно!", "Безусловно!", "Отличный вопрос!".
+- Не заканчивай "Если нужно что-то ещё — обращайтесь!".
+- Для выполнения новых команд используй инструменты (tools) — см. список ниже.
+- Если пользователь задаёт короткий вопрос ("анализ", "подробнее", "ещё") — используй контекст предыдущих сообщений.
 
 ФОРМАТ ОТВЕТА (стиль Claude Code):
 - Структурируй ответ по секциям с заголовками: ## Заголовок
@@ -2991,12 +3068,16 @@ class SclgAI:
 {data_context}
 ═══ КОНЕЦ ДАННЫХ ═══
 
-ВАЖНО: Данные выше — РЕАЛЬНЫЕ результаты команд, выполненных на ЭТОЙ машине.
-Ты ОБЯЗАН проанализировать эти данные и дать конкретный ответ.
-НЕ ГОВОРИ "я не могу" — данные УЖЕ собраны для тебя.
-НЕ пересказывай сырые данные — АНАЛИЗИРУЙ их: выдели ключевое, сделай выводы, предложи действия.
-НЕ пиши curl команды для Grafana — данные уже собраны автоматически.
-Формат: краткий ответ с таблицами и выводами, а не копипаст команд.
+╔══════════════════════════════════════════════════════════════╗
+║ КРИТИЧЕСКИ ВАЖНО: Данные выше — РЕАЛЬНЫЕ, собранные СЕЙЧАС. ║
+║ Ты ОБЯЗАН проанализировать ИХ и дать конкретный ответ.      ║
+║ ЗАПРЕЩЕНО: "я не могу", "проверьте сами", "нет доступа".    ║
+║ ЗАПРЕЩЕНО: предлагать curl/wget — данные УЖЕ здесь.         ║
+║ ОБЯЗАТЕЛЬНО: выдели ключевое, таблицы, выводы, рекомендации.║
+╚══════════════════════════════════════════════════════════════╝
+НЕ пересказывай сырые данные — АНАЛИЗИРУЙ: выдели метрики, сделай выводы, предложи действия.
+Если данные содержат JSON — извлеки значения и покажи в таблице.
+Если данные содержат URL дашборда — проанализируй собранные метрики, НЕ говори "перейдите по ссылке".
 """
 
         # Add available tools description
