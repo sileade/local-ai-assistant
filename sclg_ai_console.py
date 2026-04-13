@@ -84,7 +84,7 @@ SKILL_CLR   = C.rgb(120, 220, 200)
 
 # ── Configuration ───────────────────────────────────────────────────
 
-VERSION = "5.1.0"
+VERSION = "5.1.1"
 APP_NAME = "Scoliologic AI"
 
 GPU_BALANCER_URL = "http://10.0.0.229:11440"
@@ -380,6 +380,26 @@ SMART_PATTERNS = [
     (["grafana", "графана", "дашборд", "dashboard", "панель мониторинга", "панель grafana"],
      ["echo '=== Grafana Dashboards ===' && curl -s -H \"Authorization: Bearer $GRAFANA_TOKEN\" \"$GRAFANA_URL/api/search?type=dash-db\" 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); [print(f'- {m[\\\"title\\\"]} (uid: {m[\\\"uid\\\"]})') for m in d]\" || echo 'Grafana API недоступен'",
       "echo '=== Recent Alerts ===' && curl -s -H \"Authorization: Bearer $GRAFANA_TOKEN\" \"$GRAFANA_URL/api/alerts\" 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); [print(f'- {a[\\\"name\\\"]} [{a[\\\"state\\\"]}]') for a in d[:10]]\" || echo 'Alerts API недоступен'"],
+     "sysadmin"),
+
+    # ── Alerts / Monitoring ──
+    (["алерт", "alert", "проверь алерт", "покажи алерт", "тревог",
+      "мониторинг", "monitoring", "проверь мониторинг",
+      "что с серверами", "статус серверов", "статус кластера",
+      "что случилось", "есть проблемы", "всё ли ок", "все ли ок",
+      "check alerts", "show alerts", "any problems", "cluster status"],
+     ["echo '=== Grafana Alerts ===' && curl -s -H \"Authorization: Bearer $GRAFANA_TOKEN\" \"$GRAFANA_URL/api/alertmanager/grafana/api/v2/alerts\" 2>/dev/null | python3 -c \"import sys,json; alerts=json.load(sys.stdin); print(f'Active alerts: {len(alerts)}'); [print(f'  [{a.get(\\\"status\\\",{}).get(\\\"state\\\",\\\"?\\\")]}: {a.get(\\\"labels\\\",{}).get(\\\"alertname\\\",\\\"?\\\")} - {a.get(\\\"annotations\\\",{}).get(\\\"summary\\\",\\\"\\\")}') for a in alerts[:15]]\" 2>/dev/null || echo 'Grafana Alertmanager недоступен'",
+      "echo '=== Prometheus Alerts ===' && curl -s 'http://10.0.0.229:9090/api/v1/alerts' 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); alerts=d.get('data',{}).get('alerts',[]); print(f'Prometheus alerts: {len(alerts)}'); [print(f'  [{a[\\\"state\\\"]}] {a[\\\"labels\\\"].get(\\\"alertname\\\",\\\"?\\\")} - {a.get(\\\"annotations\\\",{}).get(\\\"summary\\\",\\\"\\\")}') for a in alerts[:15]]\" 2>/dev/null || echo 'Prometheus недоступен'",
+      "echo '=== Node Health ===' && curl -s 'http://10.0.0.229:9090/api/v1/query?query=up' 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); results=d.get('data',{}).get('result',[]); [print(f'  {r[\\\"metric\\\"].get(\\\"instance\\\",\\\"?\\\")}: {\\\"UP\\\" if r[\\\"value\\\"][1]==\\\"1\\\" else \\\"DOWN\\\"}') for r in results[:20]]\" 2>/dev/null || echo 'Prometheus недоступен'",
+      "echo '=== System Logs (errors last 1h) ===' && log show --last 1h --predicate 'eventMessage contains \\\"error\\\" or eventMessage contains \\\"fail\\\"' --style compact 2>/dev/null | tail -15 || journalctl -p err --since '1 hour ago' --no-pager -n 15 2>/dev/null || echo 'Нет логов'"],
+     "sysadmin"),
+
+    # ── Prometheus metrics ──
+    (["prometheus", "прометеус", "метрики", "metrics", "нагрузка кластер",
+      "статус нод", "node status", "здоровье кластер", "cluster health"],
+     ["echo '=== GPU Metrics ===' && curl -s 'http://10.0.0.229:9090/api/v1/query?query=nvidia_smi_gpu_temp' 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); [print(f'  {r[\\\"metric\\\"].get(\\\"instance\\\",\\\"?\\\")}: {r[\\\"value\\\"][1]}C') for r in d.get('data',{}).get('result',[])]\" 2>/dev/null || echo 'GPU metrics недоступны'",
+      "echo '=== VRAM Usage ===' && curl -s 'http://10.0.0.229:9090/api/v1/query?query=nvidia_smi_memory_used_bytes/(1024*1024*1024)' 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); [print(f'  {r[\\\"metric\\\"].get(\\\"instance\\\",\\\"?\\\")}: {float(r[\\\"value\\\"][1]):.1f} GB') for r in d.get('data',{}).get('result',[])]\" 2>/dev/null || echo 'VRAM metrics недоступны'",
+      "echo '=== CPU Usage ===' && curl -s 'http://10.0.0.229:9090/api/v1/query?query=100-(avg(rate(node_cpu_seconds_total{mode=\\\"idle\\\"}[5m]))by(instance)*100)' 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); [print(f'  {r[\\\"metric\\\"].get(\\\"instance\\\",\\\"?\\\")}: {float(r[\\\"value\\\"][1]):.1f}%') for r in d.get('data',{}).get('result',[])]\" 2>/dev/null || echo 'CPU metrics недоступны'"],
      "sysadmin"),
 ]
 
@@ -3186,9 +3206,20 @@ class SclgAI:
 - НЕ копируй сырые данные — АНАЛИЗИРУЙ и СТРУКТУРИРУЙ
 - НЕ повторяй одно и то же — каждое предложение должно нести новую информацию
 
-ИНФРАСТРУКТУРА:
-- GPU Balancer: {GPU_BALANCER_URL}
+ИНФРАСТРУКТУРА (ты имеешь ПОЛНЫЙ доступ ко всему этому):
+- Ты работаешь на Mac Mini (Apple M4) в локальной сети 172.27.4.0/24
+- GPU Balancer: {GPU_BALANCER_URL} (Ollama proxy, 23 модели)
+- Grafana: https://grafana.sclg.io (мониторинг, алерты, дашборды)
+- Prometheus: http://10.0.0.229:9090 (метрики кластера)
+- AI Кластер: 4 ноды, 7 GPU (NVIDIA)
 - Кластер: {', '.join(f'{k}({v["ip"]})' for k,v in KNOWN_HOSTS.items())}
+
+КОГДА ПОЛЬЗОВАТЕЛЬ СПРАШИВАЕТ ПРО АЛЕРТЫ/МОНИТОРИНГ:
+- Данные с Grafana/Prometheus собираются АВТОМАТИЧЕСКИ через curl
+- Ты ОБЯЗАН проанализировать собранные данные и дать конкретный ответ
+- Если алертов нет — скажи 'Активных алертов нет, все системы работают нормально'
+- Если есть — покажи таблицу с алертами и рекомендациями
+- НИКОГДА не говори 'я не имею доступа к серверам/мониторингу'
 """
 
         # Add expert-specific hint

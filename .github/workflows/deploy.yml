@@ -8,6 +8,7 @@ on:
       - 'sclg_infra_learner.py'
       - 'sclg_telegram_bot.py'
       - 'training/**'
+      - 'scripts/**'
 
 jobs:
   deploy:
@@ -45,6 +46,12 @@ jobs:
             sshpass -e scp -o StrictHostKeyChecking=no -P 2222 \
               training/*.jsonl training/*.json ilea@45.144.43.100:/tmp/sclg_training/ 2>/dev/null || true
           fi
+          # Copy scripts
+          if [ -d "scripts" ]; then
+            sshpass -e ssh -o StrictHostKeyChecking=no -p 2222 ilea@45.144.43.100 "mkdir -p /tmp/sclg_scripts"
+            sshpass -e scp -o StrictHostKeyChecking=no -P 2222 \
+              scripts/*.sh ilea@45.144.43.100:/tmp/sclg_scripts/ 2>/dev/null || true
+          fi
 
       - name: Deploy to Mac Mini via bastion
         env:
@@ -64,6 +71,10 @@ jobs:
           if [ -d "/tmp/sclg_training" ]; then
             sshpass -e scp -o StrictHostKeyChecking=no -r /tmp/sclg_training/ ilea@172.27.4.255:/tmp/sclg_training/
           fi
+          # Copy scripts to Mac Mini
+          if [ -d "/tmp/sclg_scripts" ]; then
+            sshpass -e scp -o StrictHostKeyChecking=no -r /tmp/sclg_scripts/ ilea@172.27.4.255:/tmp/sclg_scripts/
+          fi
 
           # Install on Mac Mini
           sshpass -e ssh -o StrictHostKeyChecking=no ilea@172.27.4.255 bash -s << 'MAC'
@@ -81,6 +92,13 @@ jobs:
             cp /tmp/sclg_training/*.jsonl ~/.sclg_ai/ 2>/dev/null || true
             cp /tmp/sclg_training/*.json ~/.sclg_ai/ 2>/dev/null || true
             echo "Training data deployed to ~/.sclg_ai/"
+          fi
+          # Install scripts
+          mkdir -p ~/bin
+          if [ -d "/tmp/sclg_scripts" ]; then
+            cp /tmp/sclg_scripts/*.sh ~/bin/ 2>/dev/null || true
+            chmod +x ~/bin/*.sh 2>/dev/null || true
+            echo "Scripts deployed to ~/bin/"
           fi
           echo "sclg-ai: $(python3 /opt/homebrew/bin/sclg_ai_console.py --version 2>&1)"
           echo "infra-learner: $(python3 /opt/homebrew/bin/sclg_infra_learner.py --version 2>&1)"
