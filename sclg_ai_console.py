@@ -85,7 +85,7 @@ SKILL_CLR   = C.rgb(120, 220, 200)
 
 # ── Configuration ───────────────────────────────────────────────────
 
-VERSION = "5.2.3"
+VERSION = "5.2.4"
 APP_NAME = "Scoliologic AI"
 
 GPU_BALANCER_URL = "http://10.0.0.229:11440"
@@ -490,6 +490,9 @@ class ResponseCleaner:
 
     # Regex for <think>...</think> blocks (DeepSeek, Qwen thinking tokens)
     THINK_PATTERN = re.compile(r'<think>.*?</think>', re.DOTALL)
+    # v5.2.4: Also catch unclosed <think> tags and "Thinking Process" headers
+    THINK_UNCLOSED_PATTERN = re.compile(r'<think>.*', re.DOTALL)
+    THINKING_HEADER_PATTERN = re.compile(r'(?:^|\n)\s*Thinking Process:.*?(?=\n##|\n\*\*|$)', re.DOTALL)
     # Regex for leftover role markers from chat template leaks
     ROLE_LEAK_PATTERN = re.compile(
         r'(^|\n)(user|assistant|system)\s*\n',
@@ -513,6 +516,9 @@ class ResponseCleaner:
 
         # Pass 0a: Remove <think>...</think> blocks (DeepSeek/Qwen reasoning)
         result = self.THINK_PATTERN.sub('', result)
+        # v5.2.4: Also remove unclosed <think> tags and "Thinking Process" sections
+        result = self.THINK_UNCLOSED_PATTERN.sub('', result)
+        result = self.THINKING_HEADER_PATTERN.sub('', result)
 
         # Pass 0b: Strip toxic LLM control tokens
         for token in self.TOXIC_TOKENS:
@@ -1848,7 +1854,9 @@ class StreamRenderer:
     def feed(self, token):
         """Feed a single token from the stream.
 
-        v5.0.1: Filters out <think> blocks and sensitive data in real-time.
+        v5.2.4: Rewritten to properly buffer tokens and suppress <think> blocks.
+        Tokens that could be part of a suppress/tool tag are held in a pending
+        buffer until we can confirm they're safe to print.
 
         Returns:
             None normally, or a string if a complete tool call was detected.
@@ -1864,25 +1872,33 @@ class StreamRenderer:
             self._suppress_buffer += token
             if self._suppress_end_tag in self._suppress_buffer:
                 # End of suppressed block — discard everything
-                # Check if there's content after the closing tag
                 end_idx = self._suppress_buffer.find(self._suppress_end_tag)
                 after = self._suppress_buffer[end_idx + len(self._suppress_end_tag):]
                 self._in_suppress = False
                 self._suppress_buffer = ""
                 self._suppress_end_tag = ""
-                # Feed any content after the closing tag
                 if after:
                     return self.feed(after)
             return None
 
+        # If we're inside a tool call, accumulate silently
+        if self._in_tool_call:
+            self._tool_buffer += token
+            if '</tool>' in self._tool_buffer or '</cmd>' in self._tool_buffer:
+                self._in_tool_call = False
+                tool_text = self._tool_buffer
+                self._tool_buffer = ""
+                return tool_text
+            return None
+
+        # Accumulate in pending buffer
         self._line_buffer += token
 
-        # Check for suppressed tag start
+        # Check for suppressed tag start (full match)
         for open_tag, close_tag in self._SUPPRESS_TAGS:
             if open_tag in self._line_buffer:
                 self._in_suppress = True
                 self._suppress_end_tag = close_tag
-                # Print everything before the tag
                 idx = self._line_buffer.find(open_tag)
                 before = self._line_buffer[:idx]
                 if before:
@@ -1892,38 +1908,45 @@ class StreamRenderer:
                 return None
 
         # Check for tool call start
-        if '<tool ' in self._line_buffer or '<cmd>' in self._line_buffer:
-            self._in_tool_call = True
-            for tag in ['<tool ', '<cmd>']:
+        for tag in ['<tool ', '<cmd>']:
+            if tag in self._line_buffer:
+                self._in_tool_call = True
                 idx = self._line_buffer.find(tag)
-                if idx >= 0:
-                    before = self._line_buffer[:idx]
-                    if before:
-                        self._write_safe(before)
-                    self._tool_buffer = self._line_buffer[idx:]
-                    self._line_buffer = ""
-                    return None
+                before = self._line_buffer[:idx]
+                if before:
+                    self._write_safe(before)
+                self._tool_buffer = self._line_buffer[idx:]
+                self._line_buffer = ""
+                return None
 
-        # If we're inside a tool call, accumulate silently
-        if self._in_tool_call:
-            self._tool_buffer += token
-            self._line_buffer = ""
-            if '</tool>' in self._tool_buffer or '</cmd>' in self._tool_buffer:
-                self._in_tool_call = False
-                tool_text = self._tool_buffer
-                self._tool_buffer = ""
-                return tool_text
+        # Check if buffer could be the START of a suppress/tool tag
+        # If so, hold tokens until we can confirm
+        could_be_tag = False
+        for open_tag, _ in self._SUPPRESS_TAGS:
+            for i in range(1, len(open_tag)):
+                if self._line_buffer.endswith(open_tag[:i]):
+                    could_be_tag = True
+                    break
+            if could_be_tag:
+                break
+        if not could_be_tag:
+            for tag in ['<tool ', '<cmd>']:
+                for i in range(1, len(tag)):
+                    if self._line_buffer.endswith(tag[:i]):
+                        could_be_tag = True
+                        break
+                if could_be_tag:
+                    break
+
+        if could_be_tag:
+            # Hold — don't print yet, might be start of a tag
             return None
 
-        # Regular streaming output
-        if '```' in self._line_buffer:
-            self._in_code_block = not self._in_code_block
-
-        # Print token immediately (with sensitive data masking)
-        self._write_safe(token)
-
-        # Reset line buffer on newlines
-        if '\n' in token:
+        # Safe to print — flush the entire line buffer
+        if self._line_buffer:
+            if '```' in self._line_buffer:
+                self._in_code_block = not self._in_code_block
+            self._write_safe(self._line_buffer)
             self._line_buffer = ""
 
         return None
@@ -1950,8 +1973,17 @@ class StreamRenderer:
         return self._token_count
 
     def finish(self):
-        """Finish streaming — ensure newline at end."""
-        if self._line_buffer and not self._line_buffer.endswith('\n'):
+        """Finish streaming — flush pending buffer and ensure newline."""
+        # Flush any remaining buffered text (that wasn't part of a tag)
+        if self._line_buffer and not self._in_suppress and not self._in_tool_call:
+            # Don't flush if it looks like an incomplete tag
+            text = self._line_buffer
+            is_partial_tag = text.strip().startswith('<') and '>' not in text
+            if not is_partial_tag:
+                self._write_safe(text)
+        self._line_buffer = ""
+        # Ensure newline at end
+        if self._display_buffer and not self._display_buffer.endswith('\n'):
             sys.stdout.write('\n')
             sys.stdout.flush()
 
@@ -3315,7 +3347,9 @@ class SclgAI:
 
 ПРАВИЛА ОТВЕТА:
 - Отвечай КРАТКО и ПО ДЕЛУ. Без воды.
-- Используй русский язык по умолчанию.
+- ЯЗЫК: ВСЕГДА отвечай на РУССКОМ языке. Иностранный язык только если пользователь явно пишет на другом языке.
+- ЗАПРЕЩЕНО отвечать на английском если пользователь пишет на русском. Включая заголовки, таблицы, выводы — ВСЁ на русском.
+- Технические термины (CPU, GPU, RAM, IP, DNS) можно оставлять на английском.
 - Не начинай с "Конечно!", "Безусловно!", "Отличный вопрос!".
 - Не заканчивай "Если нужно что-то ещё — обращайтесь!".
 - Для выполнения новых команд используй инструменты (tools) — см. список ниже.
@@ -3875,15 +3909,16 @@ class SclgAI:
         """
         if data_context:
             # ANALYSIS MODE: Claude must ONLY analyze existing data, NO tool calls
-            system_prompt = f"""You are Scoliologic AI, a DevOps/SysAdmin analyst.
-Your ONLY job right now: analyze the collected data and give a structured answer.
+            system_prompt = f"""Ты — Scoliologic AI, DevOps/SysAdmin аналитик.
+Твоя ЕДИНСТВЕННАЯ задача: проанализировать собранные данные и дать структурированный ответ.
 
-CRITICAL RULES:
-- DO NOT use any tools or commands. DO NOT generate <tool>, <cmd>, bash, curl, ping, or ANY commands.
-- DO NOT say 'I don't have access' or 'I cannot check'. The data is ALREADY collected.
-- DO NOT suggest the user check anything themselves.
-- ONLY analyze the data provided in the user message.
-- Answer in Russian.
+КРИТИЧЕСКИЕ ПРАВИЛА:
+- ЗАПРЕЩЕНО использовать любые инструменты или команды. ЗАПРЕЩЕНО генерировать <tool>, <cmd>, bash, curl, ping.
+- ЗАПРЕЩЕНО говорить 'я не имею доступа' или 'я не могу проверить'. Данные УЖЕ собраны.
+- ЗАПРЕЩЕНО предлагать пользователю что-то проверить самостоятельно.
+- ТОЛЬКО анализируй данные из сообщения пользователя.
+- ЯЗЫК: ВСЕГДА отвечай на РУССКОМ языке. Заголовки, таблицы, выводы — ВСЁ на русском. Технические термины (CPU, GPU, RAM, IP) можно на английском.
+- ЗАПРЕЩЕНО генерировать <think>, </think> или любые служебные токены.
 
 RESPONSE FORMAT (mandatory):
 ## Заголовок анализа
