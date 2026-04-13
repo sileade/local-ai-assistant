@@ -85,7 +85,7 @@ SKILL_CLR   = C.rgb(120, 220, 200)
 
 # ── Configuration ───────────────────────────────────────────────────
 
-VERSION = "5.2.4"
+VERSION = "5.3.0"
 APP_NAME = "Scoliologic AI"
 
 GPU_BALANCER_URL = "http://10.0.0.229:11440"
@@ -185,7 +185,7 @@ MODEL_PROFILES = {
         "system_hint": "Ты опытный программист. Пиши чистый, рабочий код. Объясняй кратко.",
     },
     "sysadmin": {
-        "models": ["sclg-devops:27b", "qwen3.5-27b-hf:latest", "gemma4-26b-hf:latest", "phi4:14b", "qwen2.5:14b", "sclg-fast:7b", "mistral:7b"],
+        "models": ["sclg-devops:26b", "sclg-devops:14b", "sclg-sysadmin:latest", "sclg-devops:14b-v2", "sclg-devops:27b", "qwen3.5-27b-hf:latest", "gemma4-26b-hf:latest", "phi4:14b", "qwen2.5:14b", "sclg-fast:7b", "mistral:7b"],
         "keywords": ["сервер", "server", "ssh", "network", "сеть", "сети", "сетев", "firewall",
             "iptables", "dns", "ip", "ping", "traceroute", "диск", "disk",
             "memory", "cpu", "gpu", "nvidia", "процесс", "process",
@@ -201,7 +201,7 @@ MODEL_PROFILES = {
         "system_hint": "Ты DevOps/SysAdmin эксперт. Выполняй команды и анализируй результаты.",
     },
     "analysis": {
-        "models": ["gemma4-26b-hf:latest", "glm-4.7-flash-hf:latest", "phi4:14b", "qwen3.5-27b-hf:latest", "sclg-general:14b"],
+        "models": ["sclg-general:26b", "sclg-general:14b-v2", "gemma4-26b-hf:latest", "glm-4.7-flash-hf:latest", "phi4:14b", "qwen3.5-27b-hf:latest", "sclg-general:14b"],
         "keywords": ["анализ", "analys", "data", "данные", "статистик",
             "медицин", "medical", "сколиоз", "исследован", "research"],
         "temperature": 0.3,
@@ -215,7 +215,7 @@ MODEL_PROFILES = {
         "system_hint": "Ты писатель. Создавай грамотный, структурированный контент.",
     },
     "general": {
-        "models": ["sclg-general:14b", "gemma4-26b-hf:latest", "glm-4.7-flash-hf:latest", "qwen3.5-27b-hf:latest", "phi4:14b", "qwen2.5:14b", "sclg-fast:7b", "llama3.1:8b"],
+        "models": ["sclg-general:26b", "sclg-general:14b-v2", "sclg-general:14b", "gemma4-26b-hf:latest", "glm-4.7-flash-hf:latest", "qwen3.5-27b-hf:latest", "phi4:14b", "qwen2.5:14b", "sclg-fast:7b", "llama3.1:8b"],
         "keywords": [],
         "temperature": 0.5,
         "system_hint": "Ты универсальный AI-ассистент. Отвечай точно и полезно.",
