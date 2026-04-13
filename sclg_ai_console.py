@@ -85,7 +85,7 @@ SKILL_CLR   = C.rgb(120, 220, 200)
 
 # ── Configuration ───────────────────────────────────────────────────
 
-VERSION = "5.2.2"
+VERSION = "5.2.3"
 APP_NAME = "Scoliologic AI"
 
 GPU_BALANCER_URL = "http://10.0.0.229:11440"
@@ -3217,6 +3217,7 @@ class SclgAI:
         self.auto_route = True
         self.agent_mode = True
         self.streaming_enabled = True  # v5.0.0: streaming by default
+        self._response_was_streamed = False  # v5.2.3: track if response was actually streamed to terminal
         self.agent_loop_max_turns = 5  # v5.0.0: max agent loop iterations
         self.claude_ok = False
         self.ollama_ok = False
@@ -3384,12 +3385,32 @@ class SclgAI:
         # This ensures the model sees the data directly in its input
         if data_context:
             base += """
-КОГДА В СООБЩЕНИИ ПОЛЬЗОВАТЕЛЯ ЕСТЬ СЕКЦИЯ 'СОБРАННЫЕ ДАННЫЕ':
-- Это РЕАЛЬНЫЕ данные, собранные АВТОМАТИЧЕСКИ с серверов прямо сейчас.
-- Ты ОБЯЗАН их проанализировать и дать конкретный ответ.
+РЕЖИМ АНАЛИЗА ДАННЫХ (АКТИВЕН):
+Данные с серверов УЖЕ СОБРАНЫ и находятся в сообщении пользователя.
+
+Твоя ЕДИНСТВЕННАЯ задача — ПРОАНАЛИЗИРОВАТЬ собранные данные.
+
+КРИТИЧЕСКИ ВАЖНО:
+- ЗАПРЕЩЕНО генерировать <tool>, <cmd>, bash, curl, ping или ЛЮБЫЕ команды.
 - ЗАПРЕЩЕНО говорить 'я не имею доступа' — данные УЖЕ перед тобой.
-- ЗАПРЕЩЕНО предлагать curl/wget — данные УЖЕ собраны.
-- Извлеки метрики, покажи в таблице, дай выводы и рекомендации.
+- ЗАПРЕЩЕНО предлагать пользователю что-то проверить самостоятельно.
+- Ты ОБЯЗАН дать СТРУКТУРИРОВАННЫЙ ответ с таблицами и выводами.
+
+ОБЯЗАТЕЛЬНЫЙ ФОРМАТ:
+## Заголовок анализа
+
+Краткое описание ситуации.
+
+| Параметр | Значение | Статус |
+|----------|----------|--------|
+| ...      | ...      | OK/WARNING/ERROR |
+
+### Вывод
+Конкретный вывод на основе данных.
+
+### Рекомендации
+- Рекомендация 1
+- Рекомендация 2
 """
 
         # Add available tools description
@@ -3551,6 +3572,7 @@ class SclgAI:
 
         if not is_good and reason in ("refusal", "no_data_for_sys_query"):
             # Model refused or gave generic advice — try Claude
+            self._response_was_streamed = False  # v5.2.3: Claude is not streamed
             if self.claude_ok and self.claude.can_use():
                 claude_spinner = Spinner("Claude re-analyzing", color=CLAUDE_CLR)
                 claude_spinner.start()
@@ -3668,8 +3690,11 @@ class SclgAI:
 {data_context}
 === КОНЕЦ ДАННЫХ ===
 
-Проанализируй собранные данные выше и ответь на вопрос. Извлеки ключевые метрики, покажи в таблице, дай выводы.
-НЕ говори 'я не имею доступа' — данные УЖЕ перед тобой. НЕ предлагай curl/wget — данные УЖЕ собраны."""
+ИНСТРУКЦИЯ: Проанализируй собранные данные выше и дай структурированный ответ.
+- НЕ генерируй <tool>, <cmd>, bash, curl или любые команды — данные УЖЕ собраны.
+- НЕ говори 'я не имею доступа' — данные перед тобой.
+- Извлеки ключевые метрики, покажи в Markdown таблице, дай выводы и рекомендации.
+- Начни ответ с ## заголовка, затем таблица, затем ### Вывод."""
         else:
             user_content = query
 
@@ -3693,8 +3718,12 @@ class SclgAI:
                     response = self._stream_response(
                         model, messages, system_prompt, config["temperature"]
                     )
-                    if response and not response.startswith("[ERROR]"):
+                    # v5.2.3: Check response has real content (not just tool tags)
+                    real_text = re.sub(r'<[^>]+>[^<]*</[^>]+>', '', response or '').strip()
+                    real_text = re.sub(r'<[^>]+>', '', real_text).strip()
+                    if response and not response.startswith("[ERROR]") and len(real_text) > 20:
                         return response
+                    # Ollama gave empty/tool-only response — fall through to Claude
                 else:
                     response = self.ollama.chat(
                         model=model,
@@ -3702,7 +3731,9 @@ class SclgAI:
                         system=system_prompt,
                         temperature=config["temperature"],
                     )
-                    if response and not response.startswith("[ERROR]"):
+                    real_text = re.sub(r'<[^>]+>[^<]*</[^>]+>', '', response or '').strip()
+                    real_text = re.sub(r'<[^>]+>', '', real_text).strip()
+                    if response and not response.startswith("[ERROR]") and len(real_text) > 20:
                         return response
 
                 # First model failed — try a smaller/faster model
@@ -3727,10 +3758,14 @@ class SclgAI:
                             temperature=config["temperature"],
                             retries=1,
                         )
-                    if response and not response.startswith("[ERROR]"):
+                    real_text = re.sub(r'<[^>]+>[^<]*</[^>]+>', '', response or '').strip()
+                    real_text = re.sub(r'<[^>]+>', '', real_text).strip()
+                    if response and not response.startswith("[ERROR]") and len(real_text) > 20:
                         return response
 
         # Fallback to Claude
+        # v5.2.3: Claude response is NOT streamed, so mark it
+        self._response_was_streamed = False
         if self.claude_ok and self.claude.can_use():
             if spinner:
                 spinner.update("Claude fallback")
@@ -3780,6 +3815,10 @@ class SclgAI:
         finally:
             renderer.finish()
             self.stream_renderer = None
+
+        # v5.2.3: Track if response was actually displayed to user
+        display_text = renderer._display_buffer.strip() if hasattr(renderer, '_display_buffer') else ''
+        self._response_was_streamed = len(display_text) > 20
 
         # Process any tool calls detected during streaming
         if pending_tool_calls:
@@ -4868,18 +4907,29 @@ RESPONSE FORMAT (mandatory):
                 draw_dashed()
                 start_time = time.time()
 
+                self._response_was_streamed = False  # Reset before each query
                 response = self.process_query(user_input)
 
                 elapsed = time.time() - start_time
 
                 # Display response
-                # v5.0.0: In streaming mode, response was already printed live.
-                # Only use TypewriterEffect for non-streaming mode.
+                # v5.2.3: Always display if response wasn't streamed to terminal
+                # This handles: Claude fallback, empty streaming, tool-only responses
                 if not self.streaming_enabled:
+                    # Non-streaming mode: always display
                     formatted = self.formatter.format(response)
                     print()  # Blank line before response
                     TypewriterEffect.print(formatted)
                     print(C.RESET, end="")
+                elif not self._response_was_streamed:
+                    # Streaming mode but response wasn't actually shown
+                    # (e.g., Claude fallback, or Ollama only generated tool tags)
+                    response_clean = re.sub(r'<[^>]+>', '', response).strip() if response else ''
+                    if len(response_clean) > 10:
+                        formatted = self.formatter.format(response)
+                        print()  # Blank line before response
+                        TypewriterEffect.print(formatted)
+                        print(C.RESET, end="")
                 else:
                     # Streaming already printed the raw response;
                     # just ensure color reset
