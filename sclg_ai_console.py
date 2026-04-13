@@ -476,6 +476,9 @@ class ResponseCleaner:
 
         result = text
 
+        # Pass 0-pre: Detect and cut off repetition loops (e.g. up/up/up/up...)
+        result = self._cut_repetition_loops(result)
+
         # Pass 0a: Remove <think>...</think> blocks (DeepSeek/Qwen reasoning)
         result = self.THINK_PATTERN.sub('', result)
 
@@ -518,6 +521,37 @@ class ResponseCleaner:
             )
 
         return result.strip()
+
+    @staticmethod
+    def _cut_repetition_loops(text):
+        """Detect and truncate repetition loops like 'up/up/up/up...' or garbage."""
+        if len(text) < 200:
+            return text
+
+        # Method 1: Find any substring of 2-30 chars that repeats 5+ times consecutively
+        loop_pat = re.compile(r'(.{2,30?}){4,}', re.DOTALL)
+        match = loop_pat.search(text)
+        if match:
+            cut_pos = match.start()
+            if cut_pos > 50:
+                return text[:cut_pos].rstrip() + '\n\n[... повторяющийся вывод обрезан ...]'
+            else:
+                return '[Ответ содержал только повторяющиеся данные и был обрезан]'
+
+        # Method 2: Check if response is >30% single trigram = garbage
+        if len(text) > 500:
+            from collections import Counter
+            trigrams = [text[i:i+3] for i in range(0, min(len(text), 2000) - 2)]
+            if trigrams:
+                most_common, count = Counter(trigrams).most_common(1)[0]
+                ratio = count / len(trigrams)
+                if ratio > 0.3:
+                    first_occ = text.find(most_common * 3)
+                    if first_occ > 50:
+                        return text[:first_occ].rstrip() + '\n\n[... повторяющийся вывод обрезан ...]'
+                    return '[Ответ содержал только повторяющиеся данные и был обрезан]'
+
+        return text
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1214,7 +1248,7 @@ class OllamaClient:
 
         return f"[ERROR] Ollama failed after {retries} attempts: {last_error}"
 
-    def chat(self, model, messages, system="", temperature=0.5, max_tokens=2048, stream=False, retries=2):
+    def chat(self, model, messages, system="", temperature=0.5, max_tokens=1500, stream=False, retries=2):
         """Chat completion from Ollama with retry logic."""
         msgs = []
         if system:
@@ -1434,19 +1468,35 @@ class ExpertRouter:
     def __init__(self, profiles=MODEL_PROFILES):
         self.profiles = profiles
 
-    def classify(self, query):
-        """Classify query into an expert category."""
+    def classify(self, query, conversation_context=None):
+        """Classify query into an expert category.
+        If query is short/ambiguous, uses conversation_context to determine topic.
+        """
         query_low = query.lower()
-        scores = {}
 
+        # For short/ambiguous queries, enrich with conversation context
+        effective_query = query_low
+        if conversation_context and len(query_low.split()) <= 5:
+            # Short query like "нужен анализ", "покажи ещё", "подробнее"
+            # — use last conversation messages to determine topic
+            ctx_text = " ".join(
+                msg.get("content", "")[:200]
+                for msg in conversation_context[-4:]
+                if msg.get("role") in ("user", "assistant")
+            ).lower()
+            effective_query = f"{query_low} {ctx_text}"
+
+        scores = {}
         for expert, profile in self.profiles.items():
             score = 0
             for kw in profile.get("keywords", []):
-                if kw in query_low:
+                if kw in effective_query:
                     score += 2
-                    # Bonus for exact word match
-                    if re.search(rf'\b{re.escape(kw)}\b', query_low):
+                    if re.search(rf'\b{re.escape(kw)}\b', effective_query):
                         score += 1
+                    # Extra bonus if keyword is in the actual query (not just context)
+                    if kw in query_low:
+                        score += 2
             scores[expert] = score
 
         # Get best expert
@@ -2105,13 +2155,23 @@ class SclgAI:
 7. Не заканчивай "Если нужно что-то ещё — обращайтесь!".
 8. НИКОГДА не генерируй токены <think>, <|endoftext|>, <|im_start|> и подобные.
 9. Не продолжай разговор от лица пользователя. Отвечай ТОЛЬКО на текущий вопрос.
+10. ЗАПРЕЩЕНО писать curl команды для Grafana/Prometheus — данные собираются АВТОМАТИЧЕСКИ.
+11. Если пользователь задаёт короткий вопрос ("анализ", "подробнее", "ещё") — используй контекст предыдущих сообщений.
 
-ФОРМАТ ОТВЕТА (очень важно!):
-- Для системных данных используй таблицы (колонки через |)
-- Группируй данные по секциям с заголовками (например: "═══ Сеть ═══", "═══ DNS ═══")
+ФОРМАТ ОТВЕТА (стиль Claude Code):
+- Структурируй ответ по секциям с заголовками: ## Заголовок
+- Для данных используй Markdown таблицы:
+  | Параметр | Значение | Статус |
+  |----------|----------|--------|
+  | CPU      | 45%      | OK     |
 - IP-адреса выделяй как есть, не маскируй
-- В конце дай краткий вывод или рекомендацию
-- Не копируй сырые данные — АНАЛИЗИРУЙ и структурируй
+- Статусы: OK/UP = зелёный, ERROR/DOWN = красный, WARNING = жёлтый
+- Команды оформляй в блоки кода: ```bash ... ```
+- В конце ОБЯЗАТЕЛЬНО дай:
+  1. Краткий вывод (1-2 предложения)
+  2. Рекомендации если есть проблемы
+- НЕ копируй сырые данные — АНАЛИЗИРУЙ и СТРУКТУРИРУЙ
+- НЕ повторяй одно и то же — каждое предложение должно нести новую информацию
 
 ИНФРАСТРУКТУРА:
 - GPU Balancer: {GPU_BALANCER_URL}
@@ -2132,6 +2192,21 @@ class SclgAI:
         if knowledge_ctx:
             base += f"\n{knowledge_ctx}\n"
 
+        # Add conversation context for continuity
+        if hasattr(self, 'conversation') and self.conversation:
+            recent = self.conversation[-4:]
+            if recent:
+                ctx_lines = []
+                for msg in recent:
+                    role = msg.get("role", "?")
+                    content = msg.get("content", "")[:300]
+                    ctx_lines.append(f"  {role}: {content}")
+                base += f"""
+КОНТЕКСТ ДИАЛОГА (последние сообщения):
+{chr(10).join(ctx_lines)}
+Учитывай этот контекст при ответе. Если пользователь говорит "анализ", "подробнее", "ещё" — он имеет в виду тему из предыдущих сообщений.
+"""
+
         # Add collected data context
         if data_context:
             base += f"""
@@ -2143,6 +2218,7 @@ class SclgAI:
 Ты ОБЯЗАН проанализировать эти данные и дать конкретный ответ.
 НЕ ГОВОРИ "я не могу" — данные УЖЕ собраны для тебя.
 НЕ пересказывай сырые данные — АНАЛИЗИРУЙ их: выдели ключевое, сделай выводы, предложи действия.
+НЕ пиши curl команды для Grafana — данные уже собраны автоматически.
 Формат: краткий ответ с таблицами и выводами, а не копипаст команд.
 """
 
@@ -2163,8 +2239,8 @@ class SclgAI:
             print(f"  {DIM_COLOR}(cached){C.RESET}")
             return cached
 
-        # Step 1: Classify query (MoE routing)
-        expert, confidence = self.router.classify(query)
+        # Step 1: Classify query (MoE routing) — with conversation context for short queries
+        expert, confidence = self.router.classify(query, conversation_context=self.conversation)
         self.current_expert = expert
 
         # Step 2: Check if this is a direct command to execute
@@ -2172,8 +2248,19 @@ class SclgAI:
             return self._execute_direct_command(query)
 
         # Step 3: Smart Execute — run commands FIRST if pattern matches
+        # For short queries, try to resolve context from conversation history
+        enriched_query = query
+        if len(query.split()) <= 5 and self.conversation:
+            # Short query — check if previous messages give context
+            last_topics = []
+            for msg in self.conversation[-4:]:
+                if msg.get("role") == "user":
+                    last_topics.append(msg.get("content", ""))
+            if last_topics:
+                enriched_query = f"{query} (контекст: {' '.join(last_topics[-2:])})"
+
         data_context = ""
-        commands, category = self.executor.match(query)
+        commands, category = self.executor.match(enriched_query)
         if commands:
             print(f"  {TOOL_CLR}⚡ Collecting system data...{C.RESET}")
             data_context = self.executor.execute(commands)
