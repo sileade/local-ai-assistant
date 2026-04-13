@@ -85,7 +85,7 @@ SKILL_CLR   = C.rgb(120, 220, 200)
 
 # ── Configuration ───────────────────────────────────────────────────
 
-VERSION = "5.2.0"
+VERSION = "5.2.1"
 APP_NAME = "Scoliologic AI"
 
 GPU_BALANCER_URL = "http://10.0.0.229:11440"
@@ -3358,7 +3358,16 @@ class SclgAI:
 """
 
         # Add available tools description
-        base += self.tool_registry.get_tools_prompt()
+        # v5.2.1: When data is already collected, do NOT show tools
+        # This prevents the model from running its own commands instead of analyzing
+        if not data_context:
+            base += self.tool_registry.get_tools_prompt()
+        else:
+            base += """
+\nВАЖНО: Данные уже собраны и переданы тебе в сообщении пользователя.
+Твоя задача — ТОЛЬКО АНАЛИЗИРОВАТЬ данные. НЕ запускай никаких команд.
+Дай структурированный ответ с таблицами, выводами и рекомендациями.
+"""
 
         return base
 
@@ -3529,7 +3538,15 @@ class SclgAI:
         response = self.cleaner.clean(response)
 
         # Step 8: Process remaining agent commands in response (legacy + new)
-        response = self._process_agent_commands(response)
+        # v5.2.1: If data was already collected, DO NOT execute tool calls
+        # (Claude should have given analysis-only response)
+        if data_context:
+            # Strip any tool/cmd tags that Claude may have generated despite instructions
+            response = re.sub(r'<tool name="[^"]*">(.*?)</tool>', '', response, flags=re.DOTALL)
+            response = re.sub(r'<cmd>(.*?)</cmd>', '', response, flags=re.DOTALL)
+            response = response.strip()
+        else:
+            response = self._process_agent_commands(response)
 
         # Step 9: Cache good responses
         if is_good or (not response.startswith("[ERROR]")):
@@ -3772,26 +3789,63 @@ class SclgAI:
         return '\n'.join(lines)
 
     def _claude_fallback(self, query, data_context="", expert="general"):
-        """Use Claude as fallback."""
-        system_prompt = self._build_system_prompt(expert, data_context)
+        """Use Claude as fallback.
+
+        v5.2.1: When data_context exists, Claude gets ANALYSIS-ONLY prompt
+        without tools. This prevents Claude from running its own commands
+        when data is already collected.
+        """
+        if data_context:
+            # ANALYSIS MODE: Claude must ONLY analyze existing data, NO tool calls
+            system_prompt = f"""You are Scoliologic AI, a DevOps/SysAdmin analyst.
+Your ONLY job right now: analyze the collected data and give a structured answer.
+
+CRITICAL RULES:
+- DO NOT use any tools or commands. DO NOT generate <tool>, <cmd>, bash, curl, ping, or ANY commands.
+- DO NOT say 'I don't have access' or 'I cannot check'. The data is ALREADY collected.
+- DO NOT suggest the user check anything themselves.
+- ONLY analyze the data provided in the user message.
+- Answer in Russian.
+
+RESPONSE FORMAT (mandatory):
+## Заголовок анализа
+
+Краткое описание что было проверено.
+
+### Результаты
+
+| Параметр | Значение | Статус |
+|----------|----------|--------|
+| ...      | ...      | OK/WARNING/ERROR |
+
+### Проблемы
+
+(если есть проблемы - описать каждую)
+
+### Выводы
+
+1-2 предложения с итогом.
+
+### Рекомендации
+
+(если есть проблемы - что делать)
+"""
+            user_content = f"""Вопрос пользователя: {query}
+
+=== СОБРАННЫЕ ДАННЫЕ (реальные, собраны автоматически с серверов) ===
+{data_context}
+=== КОНЕЦ ДАННЫХ ===
+
+Проанализируй данные выше. Дай структурированный ответ с таблицами и выводами.
+НЕ запускай никаких команд. НЕ генерируй <tool> или <cmd> теги. ТОЛЬКО анализ."""
+        else:
+            # NO DATA: Claude can use tools freely
+            system_prompt = self._build_system_prompt(expert, data_context)
+            user_content = query
 
         messages = []
         for msg in self.conversation[-4:]:
             messages.append(msg)
-
-        # v5.2.0: Inject data into user message for Claude too
-        if data_context:
-            user_content = f"""VOPROS: {query}
-
-=== COLLECTED DATA (real, gathered automatically from servers right now) ===
-{data_context}
-=== END DATA ===
-
-Analyze the collected data above and answer the question. Extract key metrics, show in table, give conclusions.
-DO NOT say 'I don't have access' — the data is RIGHT HERE. DO NOT suggest curl/wget — data is ALREADY collected."""
-        else:
-            user_content = query
-
         messages.append({"role": "user", "content": user_content})
 
         self.current_model = "claude"
@@ -3856,13 +3910,12 @@ DO NOT say 'I don't have access' — the data is RIGHT HERE. DO NOT suggest curl
         """Multi-turn agent loop — the AI can call tools and continue reasoning.
 
         v5.0.0: Inspired by IronClaw's loop_engine.
-        The model generates a response, we execute any tool calls,
-        feed results back, and let the model continue until it's done
-        or we hit max turns.
-
-        This replaces the old single-shot process_query + _process_agent_commands flow.
+        v5.2.1: Added forced summary after tool calls, time limit (90s),
+                 reduced max turns to 3 for faster responses.
         """
         system_prompt = self._build_system_prompt(expert, data_context)
+        loop_start = time.time()
+        LOOP_TIME_LIMIT = 90  # seconds — hard limit for agent loop
 
         # Build initial messages
         messages = []
@@ -3871,7 +3924,7 @@ DO NOT say 'I don't have access' — the data is RIGHT HERE. DO NOT suggest curl
 
         # v5.2.0: Inject collected data DIRECTLY into user message
         if data_context:
-            user_msg = f"""VOPROS: {query}
+            user_msg = f"""ВОПРОС: {query}
 
 === СОБРАННЫЕ ДАННЫЕ (реальные, собраны автоматически с серверов прямо сейчас) ===
 {data_context}
@@ -3885,9 +3938,18 @@ DO NOT say 'I don't have access' — the data is RIGHT HERE. DO NOT suggest curl
 
         full_response = ""
         turn = 0
+        had_tool_calls = False  # Track if any tool calls were made
+        max_turns = min(self.agent_loop_max_turns, 3)  # v5.2.1: cap at 3 turns
 
-        while turn < self.agent_loop_max_turns:
+        while turn < max_turns:
             turn += 1
+
+            # v5.2.1: Time limit check
+            elapsed = time.time() - loop_start
+            if elapsed > LOOP_TIME_LIMIT:
+                if not self.streaming_enabled:
+                    print(f"  {DIM_COLOR}⏱ Agent loop time limit ({LOOP_TIME_LIMIT}s) reached{C.RESET}")
+                break
 
             # Get AI response
             if self.ollama_ok:
@@ -3933,6 +3995,8 @@ DO NOT say 'I don't have access' — the data is RIGHT HERE. DO NOT suggest curl
                 full_response += response
                 break
 
+            had_tool_calls = True
+
             # Execute tool calls and collect results
             tool_outputs = []
             for tool_name, params in calls:
@@ -3957,11 +4021,82 @@ DO NOT say 'I don't have access' — the data is RIGHT HERE. DO NOT suggest curl
             # Feed tool results back to the model
             messages.append({"role": "assistant", "content": response})
             tool_result_msg = "\n".join(tool_outputs)
-            messages.append({"role": "user", "content": f"Результаты инструментов:\n{tool_result_msg}\n\nПроанализируй результаты и продолжи. Если нужно больше данных — вызови ещё инструменты. Если достаточно — дай финальный ответ."})
+
+            # v5.2.1: On last turn, force summary request
+            if turn >= max_turns - 1:
+                messages.append({"role": "user", "content": f"""Результаты инструментов:
+{tool_result_msg}
+
+Это ПОСЛЕДНИЙ ход. Дай ФИНАЛЬНЫЙ структурированный ответ на русском:
+## Заголовок
+Краткое описание.
+### Результаты
+| Параметр | Значение | Статус |
+|----------|----------|--------|
+| ... | ... | OK/WARNING/ERROR |
+### Проблемы
+(если есть)
+### Выводы
+1-2 предложения.
+### Рекомендации
+(если есть проблемы)
+
+НЕ запускай больше команд. ТОЛЬКО анализ и ответ."""})
+            else:
+                messages.append({"role": "user", "content": f"Результаты инструментов:\n{tool_result_msg}\n\nПроанализируй результаты и продолжи. Если нужно больше данных — вызови ещё инструменты. Если достаточно — дай финальный ответ."})
 
             # Print turn indicator
             if not self.streaming_enabled:
-                print(f"  {DIM_COLOR}↻ Agent loop turn {turn}/{self.agent_loop_max_turns} — {len(calls)} tool(s) executed{C.RESET}")
+                print(f"  {DIM_COLOR}↻ Agent loop turn {turn}/{max_turns} — {len(calls)} tool(s) executed{C.RESET}")
+
+        # v5.2.1: If agent loop ended after tool calls but no summary, force one
+        if had_tool_calls and not full_response.strip():
+            # Agent executed tools but never gave a final answer — request summary
+            summary_prompt = f"""На основе всех выполненных команд и их результатов, дай ФИНАЛЬНЫЙ структурированный ответ на вопрос пользователя: {query}
+
+Формат ответа:
+## Заголовок
+Краткое описание.
+### Результаты
+| Параметр | Значение | Статус |
+|----------|----------|--------|
+| ... | ... | OK/WARNING/ERROR |
+### Проблемы
+(если есть)
+### Выводы и рекомендации
+
+НЕ запускай команды. ТОЛЬКО анализ."""
+            messages.append({"role": "user", "content": summary_prompt})
+
+            if not self.streaming_enabled:
+                summary_spinner = Spinner("Generating summary", color=ACCENT2)
+                summary_spinner.start()
+
+            try:
+                if self.claude_ok and self.claude.can_use():
+                    self.current_model = "claude"
+                    summary = self.claude.chat(messages=messages, system="You are a DevOps analyst. Give a structured summary in Russian. NO commands, ONLY analysis.")
+                elif self.ollama_ok:
+                    config = self.router.get_model_and_config(expert, self.ollama)
+                    model = config["model"]
+                    if model:
+                        summary = self.ollama.chat(
+                            model=model, messages=messages,
+                            system="You are a DevOps analyst. Give a structured summary in Russian. NO commands, ONLY analysis.",
+                            temperature=0.3,
+                        )
+                    else:
+                        summary = ""
+                else:
+                    summary = ""
+            except Exception:
+                summary = ""
+            finally:
+                if not self.streaming_enabled:
+                    summary_spinner.stop("Summary ready")
+
+            if summary and not summary.startswith("[ERROR]"):
+                full_response = summary
 
         if not full_response:
             if data_context:
