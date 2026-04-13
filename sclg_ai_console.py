@@ -84,7 +84,7 @@ SKILL_CLR   = C.rgb(120, 220, 200)
 
 # ── Configuration ───────────────────────────────────────────────────
 
-VERSION = "5.1.1"
+VERSION = "5.2.0"
 APP_NAME = "Scoliologic AI"
 
 GPU_BALANCER_URL = "http://10.0.0.229:11440"
@@ -3067,6 +3067,89 @@ class InfraLearnerBridge:
 
 
 # ══════════════════════════════════════════════════════════════════════
+# OUTLINE WIKI CLIENT — docs.sclg.io knowledge base
+# ══════════════════════════════════════════════════════════════════════
+
+OUTLINE_URL = "https://docs.sclg.io"
+OUTLINE_API_KEY = "ol_api_Eg2qX376c1zTaqUScNvNr4g2O2mhB3y6rL8i8A"
+
+class OutlineClient:
+    """Client for Outline wiki API (docs.sclg.io).
+
+    v5.2.0: Provides knowledge base search for AI responses.
+    Searches documentation and returns relevant content.
+    """
+
+    def __init__(self):
+        self.url = OUTLINE_URL
+        self.api_key = OUTLINE_API_KEY
+        self.available = False
+        self._ssl_ctx = ssl.create_default_context()
+        self._ssl_ctx.check_hostname = False
+        self._ssl_ctx.verify_mode = ssl.CERT_NONE
+
+    def check(self) -> bool:
+        """Check if Outline is accessible."""
+        try:
+            result = self._api("collections.list", {})
+            self.available = bool(result.get("data"))
+            return self.available
+        except Exception:
+            self.available = False
+            return False
+
+    def _api(self, method: str, data: dict) -> dict:
+        """Make Outline API call."""
+        try:
+            url = f"{self.url}/api/{method}"
+            payload = json.dumps(data).encode()
+            req = urllib.request.Request(
+                url,
+                data=payload,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                },
+                method="POST",
+            )
+            resp = urllib.request.urlopen(req, timeout=15, context=self._ssl_ctx)
+            return json.loads(resp.read().decode())
+        except Exception:
+            return {}
+
+    def search(self, query: str, limit: int = 5) -> str:
+        """Search documents and return formatted results."""
+        result = self._api("documents.search", {"query": query, "limit": limit})
+        docs = result.get("data", [])
+        if not docs:
+            return ""
+
+        parts = ["=== DOCUMENTATION (docs.sclg.io) ==="]
+        for doc in docs:
+            d = doc.get("document", {})
+            title = d.get("title", "Untitled")
+            text = d.get("text", "")
+            # Truncate to first 1500 chars per doc
+            if len(text) > 1500:
+                text = text[:1500] + "..."
+            parts.append(f"\n--- {title} ---")
+            parts.append(text)
+        return "\n".join(parts)
+
+    def get_collections(self) -> list:
+        """Get all collections."""
+        result = self._api("collections.list", {})
+        return result.get("data", [])
+
+    def get_document(self, doc_id: str) -> str:
+        """Get full document by ID."""
+        result = self._api("documents.info", {"id": doc_id})
+        doc = result.get("data", {})
+        return doc.get("text", "")
+
+
+# ══════════════════════════════════════════════════════════════════════
 # SCLG-AI MAIN CLASS — The Agent
 # ══════════════════════════════════════════════════════════════════════
 
@@ -3088,6 +3171,7 @@ class SclgAI:
         self.stats = StatsTracker()
         self.training = TrainingCollector()
         self.learner = InfraLearnerBridge()
+        self.outline = OutlineClient()
         self.formatter = OutputFormatter()
         self.tool_registry = ToolRegistry()
         self.stream_renderer = None  # Created per-query
@@ -3162,6 +3246,17 @@ class SclgAI:
         else:
             spinner3.stop()
             print(f"  {DIM_COLOR}○ Grafana/InfraLearner not available{C.RESET}")
+
+        # Check Outline Wiki (docs.sclg.io)
+        spinner4 = Spinner("Checking docs.sclg.io", color=ACCENT2)
+        spinner4.start()
+        outline_ok = self.outline.check()
+        if outline_ok:
+            cols = len(self.outline.get_collections())
+            spinner4.stop(f"Docs: {cols} collections")
+        else:
+            spinner4.stop()
+            print(f"  {DIM_COLOR}○ docs.sclg.io not available{C.RESET}")
 
     # ── System Prompt Builder ───────────────────────────────────────
 
@@ -3251,23 +3346,16 @@ class SclgAI:
 Учитывай этот контекст при ответе. Если пользователь говорит "анализ", "подробнее", "ещё" — он имеет в виду тему из предыдущих сообщений.
 """
 
-        # Add collected data context
+        # NOTE: data_context is now injected into user message, not system prompt
+        # This ensures the model sees the data directly in its input
         if data_context:
-            base += f"""
-═══ СОБРАННЫЕ ДАННЫЕ (выполнены команды на этой машине) ═══
-{data_context}
-═══ КОНЕЦ ДАННЫХ ═══
-
-╔══════════════════════════════════════════════════════════════╗
-║ КРИТИЧЕСКИ ВАЖНО: Данные выше — РЕАЛЬНЫЕ, собранные СЕЙЧАС. ║
-║ Ты ОБЯЗАН проанализировать ИХ и дать конкретный ответ.      ║
-║ ЗАПРЕЩЕНО: "я не могу", "проверьте сами", "нет доступа".    ║
-║ ЗАПРЕЩЕНО: предлагать curl/wget — данные УЖЕ здесь.         ║
-║ ОБЯЗАТЕЛЬНО: выдели ключевое, таблицы, выводы, рекомендации.║
-╚══════════════════════════════════════════════════════════════╝
-НЕ пересказывай сырые данные — АНАЛИЗИРУЙ: выдели метрики, сделай выводы, предложи действия.
-Если данные содержат JSON — извлеки значения и покажи в таблице.
-Если данные содержат URL дашборда — проанализируй собранные метрики, НЕ говори "перейдите по ссылке".
+            base += """
+КОГДА В СООБЩЕНИИ ПОЛЬЗОВАТЕЛЯ ЕСТЬ СЕКЦИЯ 'СОБРАННЫЕ ДАННЫЕ':
+- Это РЕАЛЬНЫЕ данные, собранные АВТОМАТИЧЕСКИ с серверов прямо сейчас.
+- Ты ОБЯЗАН их проанализировать и дать конкретный ответ.
+- ЗАПРЕЩЕНО говорить 'я не имею доступа' — данные УЖЕ перед тобой.
+- ЗАПРЕЩЕНО предлагать curl/wget — данные УЖЕ собраны.
+- Извлеки метрики, покажи в таблице, дай выводы и рекомендации.
 """
 
         # Add available tools description
@@ -3365,6 +3453,24 @@ class SclgAI:
                     "df -h 2>/dev/null | head -5",
                 ])
             data_context = self.executor.execute(generic_cmds)
+
+        # Step 4.5: Search Outline docs if relevant
+        if self.outline.available:
+            doc_keywords = [
+                "doc", "docs", "документ", "инструкц", "wiki",
+                "как настроить", "как сделать", "how to", "setup", "guide",
+                "1с", "1c", "haproxy", "nginx", "postgres", "backup",
+                "регламент", "процедур", "политик",
+                "конфиг", "config", "настройк",
+            ]
+            q_low = query.lower()
+            if any(kw in q_low for kw in doc_keywords):
+                try:
+                    doc_results = self.outline.search(query, limit=3)
+                    if doc_results:
+                        data_context += f"\n\n{doc_results}"
+                except Exception:
+                    pass
 
         # Step 5: Get AI response — v5.0.0 uses agent loop for multi-turn
         use_agent_loop = self.agent_mode and not data_context
@@ -3497,7 +3603,22 @@ class SclgAI:
         messages = []
         for msg in self.conversation[-6:]:
             messages.append(msg)
-        messages.append({"role": "user", "content": query})
+
+        # v5.2.0: Inject collected data DIRECTLY into user message
+        # This is critical — models often ignore data in system prompt
+        if data_context:
+            user_content = f"""ВОПРОС: {query}
+
+=== СОБРАННЫЕ ДАННЫЕ (реальные, собраны автоматически с серверов прямо сейчас) ===
+{data_context}
+=== КОНЕЦ ДАННЫХ ===
+
+Проанализируй собранные данные выше и ответь на вопрос. Извлеки ключевые метрики, покажи в таблице, дай выводы.
+НЕ говори 'я не имею доступа' — данные УЖЕ перед тобой. НЕ предлагай curl/wget — данные УЖЕ собраны."""
+        else:
+            user_content = query
+
+        messages.append({"role": "user", "content": user_content})
 
         # Try local model first
         if self.ollama_ok:
@@ -3658,7 +3779,21 @@ class SclgAI:
         messages = []
         for msg in self.conversation[-4:]:
             messages.append(msg)
-        messages.append({"role": "user", "content": query})
+
+        # v5.2.0: Inject data into user message for Claude too
+        if data_context:
+            user_content = f"""VOPROS: {query}
+
+=== COLLECTED DATA (real, gathered automatically from servers right now) ===
+{data_context}
+=== END DATA ===
+
+Analyze the collected data above and answer the question. Extract key metrics, show in table, give conclusions.
+DO NOT say 'I don't have access' — the data is RIGHT HERE. DO NOT suggest curl/wget — data is ALREADY collected."""
+        else:
+            user_content = query
+
+        messages.append({"role": "user", "content": user_content})
 
         self.current_model = "claude"
         response = self.claude.chat(
@@ -3735,9 +3870,16 @@ class SclgAI:
         for msg in self.conversation[-6:]:
             messages.append(msg)
 
-        # If we have pre-collected data, include it in the user message
+        # v5.2.0: Inject collected data DIRECTLY into user message
         if data_context:
-            user_msg = f"{query}\n\nСобранные данные:\n{data_context}"
+            user_msg = f"""VOPROS: {query}
+
+=== СОБРАННЫЕ ДАННЫЕ (реальные, собраны автоматически с серверов прямо сейчас) ===
+{data_context}
+=== КОНЕЦ ДАННЫХ ===
+
+Проанализируй собранные данные и ответь на вопрос. Извлеки ключевые метрики, покажи в таблице, дай выводы.
+НЕ говори 'я не имею доступа' — данные УЖЕ перед тобой."""
         else:
             user_msg = query
         messages.append({"role": "user", "content": user_msg})
@@ -3890,6 +4032,8 @@ class SclgAI:
             self._show_tools()
         elif command in ("/train", "/training"):
             self._handle_training(args)
+        elif command in ("/docs", "/wiki"):
+            self._search_docs(args)
         elif command in ("/version", "/v"):
             print(f"  sclg-ai v{VERSION}")
         elif command in ("/quit", "/q", "/exit"):
@@ -3918,6 +4062,7 @@ class SclgAI:
   {TOOL_CLR}/stream{C.RESET}    — Toggle streaming mode (live token output)
   {TOOL_CLR}/tools{C.RESET}     — Show available agent tools
   {TOOL_CLR}/train{C.RESET}     — Training: stats/export/merge/test/cycle
+  {TOOL_CLR}/docs{C.RESET}      — Search docs.sclg.io wiki
   {TOOL_CLR}/version{C.RESET}   — Show version
   {TOOL_CLR}/quit{C.RESET}      — Exit
 """)
@@ -4070,6 +4215,34 @@ class SclgAI:
         color = SYSTEM_CLR if pct >= 80 else WARN_CLR if pct >= 50 else ERROR_CLR
         print(f"  {color}{passed}/{total} passed ({pct:.0f}%){C.RESET}")
         print()
+
+    def _search_docs(self, args):
+        """Search docs.sclg.io via Outline API."""
+        if not args:
+            if not self.outline.available:
+                print(f"  {WARN_CLR}docs.sclg.io not available{C.RESET}")
+                return
+            cols = self.outline.get_collections()
+            print(f"\n{ACCENT}--- docs.sclg.io Collections ---{C.RESET}")
+            for col in cols:
+                name = col.get("name", "?")
+                docs_count = col.get("documents", {}).get("count", 0) if isinstance(col.get("documents"), dict) else 0
+                print(f"  {TOOL_CLR}{name}{C.RESET} ({docs_count} docs)")
+            print()
+            return
+
+        spinner = Spinner(f"Searching docs: {args[:40]}", color=ACCENT2)
+        spinner.start()
+        try:
+            result = self.outline.search(args, limit=5)
+            spinner.stop(f"Found results")
+            if result:
+                print(f"\n{result}\n")
+            else:
+                print(f"  {DIM_COLOR}No results for: {args}{C.RESET}")
+        except Exception as e:
+            spinner.stop()
+            print(f"  {ERROR_CLR}Search error: {e}{C.RESET}")
 
     def _show_hosts(self):
         host_spinner = Spinner("Checking hosts", color=TOOL_CLR, style="dots")
