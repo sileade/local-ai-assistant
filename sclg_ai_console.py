@@ -84,7 +84,7 @@ SKILL_CLR   = C.rgb(120, 220, 200)
 
 # ── Configuration ───────────────────────────────────────────────────
 
-VERSION = "5.0.1"
+VERSION = "5.1.0"
 APP_NAME = "Scoliologic AI"
 
 GPU_BALANCER_URL = "http://10.0.0.229:11440"
@@ -2440,14 +2440,62 @@ class QualityChecker:
 # ══════════════════════════════════════════════════════════════════════
 
 class TrainingCollector:
-    """Collects good responses for self-learning."""
+    """Collects good responses for self-learning with quality scoring,
+    dedup, golden dataset merge, and Modelfile export."""
+
+    GOLDEN_FILE = os.path.join(DATA_DIR, "golden_dataset.jsonl")
+    MODELFILE_DIR = os.path.join(DATA_DIR, "modelfiles")
+    MIN_QUALITY = 0.6
 
     def __init__(self, training_file=TRAINING_FILE):
         self.training_file = training_file
+        os.makedirs(self.MODELFILE_DIR, exist_ok=True)
+        self._seen_hashes = set()
+        self._load_seen_hashes()
 
-    def save(self, query, response, expert, model, quality_score=1.0):
-        """Save a good response as training data."""
+    def _load_seen_hashes(self):
         try:
+            if os.path.exists(self.training_file):
+                with open(self.training_file) as f:
+                    for line in f:
+                        try:
+                            e = json.loads(line)
+                            self._seen_hashes.add(hash(e.get("query", "")[:100]))
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+
+    def _score_quality(self, query, response, model=""):
+        score = 0.0
+        if "|" in response and "---" in response:
+            score += 0.15
+        if "```" in response:
+            score += 0.10
+        if "<tool " in response or "<cmd>" in response:
+            score += 0.15
+        if re.search(r'^#{1,3} ', response, re.MULTILINE):
+            score += 0.10
+        if re.search(r'(\u0432\u044b\u0432\u043e\u0434|\u0440\u0435\u043a\u043e\u043c\u0435\u043d\u0434\u0430\u0446\u0438|\u0438\u0442\u043e\u0433|conclusion|summary)', response.lower()):
+            score += 0.10
+        if 100 <= len(response) <= 2000:
+            score += 0.10
+        refusal_pats = ["\u043d\u0435 \u043c\u043e\u0433\u0443", "\u043d\u0435\u0442 \u0434\u043e\u0441\u0442\u0443\u043f\u0430", "cannot", "i don't have"]
+        if not any(p in response.lower() for p in refusal_pats):
+            score += 0.20
+        if "claude" in model.lower():
+            score += 0.10
+        return round(min(score, 1.0), 2)
+
+    def save(self, query, response, expert, model, quality_score=None):
+        try:
+            q_hash = hash(query[:100])
+            if q_hash in self._seen_hashes:
+                return
+            if quality_score is None:
+                quality_score = self._score_quality(query, response, model)
+            if quality_score < self.MIN_QUALITY:
+                return
             entry = {
                 "query": query,
                 "response": response[:3000],
@@ -2458,18 +2506,129 @@ class TrainingCollector:
             }
             with open(self.training_file, "a") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-        except:
+            self._seen_hashes.add(q_hash)
+        except Exception:
             pass
 
     def count(self):
-        """Count training entries."""
         try:
             if os.path.exists(self.training_file):
                 with open(self.training_file) as f:
                     return sum(1 for _ in f)
-        except:
+        except Exception:
             pass
         return 0
+
+    def get_entries(self, min_quality=0.0):
+        entries = []
+        try:
+            if os.path.exists(self.training_file):
+                with open(self.training_file) as f:
+                    for line in f:
+                        try:
+                            e = json.loads(line)
+                            if e.get("quality", 0) >= min_quality:
+                                entries.append(e)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        return entries
+
+    def merge_golden(self, golden_path=None):
+        golden_path = golden_path or self.GOLDEN_FILE
+        if not os.path.exists(golden_path):
+            return 0
+        added = 0
+        try:
+            with open(golden_path) as f:
+                for line in f:
+                    try:
+                        e = json.loads(line)
+                        q_hash = hash(e.get("query", "")[:100])
+                        if q_hash not in self._seen_hashes:
+                            e["quality"] = 1.0
+                            e["timestamp"] = datetime.now().isoformat()
+                            with open(self.training_file, "a") as tf:
+                                tf.write(json.dumps(e, ensure_ascii=False) + "\n")
+                            self._seen_hashes.add(q_hash)
+                            added += 1
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return added
+
+    def export_modelfile(self, base_model="gemma3:27b", expert="sysadmin",
+                         output_name=None, min_quality=0.7):
+        entries = self.get_entries(min_quality=min_quality)
+        if expert != "all":
+            entries = [e for e in entries if e.get("expert") == expert]
+        if not entries:
+            return None, "No training data above quality threshold"
+        entries.sort(key=lambda x: x.get("quality", 0), reverse=True)
+        entries = entries[:50]
+        output_name = output_name or f"sclg-{expert}"
+        modelfile_path = os.path.join(self.MODELFILE_DIR, f"Modelfile.{output_name}")
+        lines = []
+        lines.append(f"FROM {base_model}")
+        lines.append("")
+        lines.append("PARAMETER temperature 0.3")
+        lines.append("PARAMETER top_p 0.9")
+        lines.append("PARAMETER repeat_penalty 1.15")
+        lines.append("PARAMETER num_ctx 8192")
+        lines.append('PARAMETER stop "<end_of_turn>"')
+        lines.append('PARAMETER stop "<start_of_turn>"')
+        lines.append('PARAMETER stop "\\nAssistant:"')
+        lines.append("")
+        profile = MODEL_PROFILES.get(expert, MODEL_PROFILES["general"])
+        system_hint = profile.get("system_hint", "")
+        sys_text = "SYSTEM \"\"\"\n"
+        sys_text += "You are sclg-ai, autonomous DevOps/SysAdmin agent for SCLG AI cluster.\n"
+        sys_text += f"{system_hint}\n"
+        sys_text += "RULES:\n"
+        sys_text += '1. You have FULL access to the system via tool calling.\n'
+        sys_text += '2. Use <tool name="bash">{"command": "..."}</tool> to execute commands.\n'
+        sys_text += '3. NEVER refuse - you CAN execute commands.\n'
+        sys_text += '4. Always analyze collected data, do not just copy it.\n'
+        sys_text += '5. Respond with structure: ## headers, | tables |, ### Conclusion.\n'
+        sys_text += '6. No AI-isms: no "Of course!", "Absolutely!", "Let me know!".\n'
+        sys_text += '\"\"\"'
+        lines.append(sys_text)
+        lines.append("")
+        for entry in entries:
+            q = entry["query"].replace('"', '\\"').replace('\n', '\\n')
+            r = entry["response"].replace('"', '\\"').replace('\n', '\\n')
+            lines.append(f'MESSAGE user "{q}"')
+            lines.append(f'MESSAGE assistant "{r}"')
+            lines.append("")
+        try:
+            with open(modelfile_path, "w") as f:
+                f.write("\n".join(lines))
+            return modelfile_path, f"Modelfile created with {len(entries)} examples"
+        except Exception as e:
+            return None, f"Error: {e}"
+
+    def stats(self):
+        entries = self.get_entries()
+        if not entries:
+            return {"total": 0}
+        experts = {}
+        models = {}
+        qualities = []
+        for e in entries:
+            exp = e.get("expert", "unknown")
+            mod = e.get("model", "unknown")
+            experts[exp] = experts.get(exp, 0) + 1
+            models[mod] = models.get(mod, 0) + 1
+            qualities.append(e.get("quality", 0))
+        return {
+            "total": len(entries),
+            "by_expert": experts,
+            "by_model": models,
+            "avg_quality": round(sum(qualities) / len(qualities), 2) if qualities else 0,
+            "high_quality": sum(1 for q in qualities if q >= 0.7),
+        }
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -3698,6 +3857,8 @@ class SclgAI:
             print(f"  {SYSTEM_CLR}Streaming: {state}{C.RESET}")
         elif command in ("/tools",):
             self._show_tools()
+        elif command in ("/train", "/training"):
+            self._handle_training(args)
         elif command in ("/version", "/v"):
             print(f"  sclg-ai v{VERSION}")
         elif command in ("/quit", "/q", "/exit"):
@@ -3725,6 +3886,7 @@ class SclgAI:
   {TOOL_CLR}/new{C.RESET}       — New session (consolidate memory)
   {TOOL_CLR}/stream{C.RESET}    — Toggle streaming mode (live token output)
   {TOOL_CLR}/tools{C.RESET}     — Show available agent tools
+  {TOOL_CLR}/train{C.RESET}     — Training: stats/export/merge/test/cycle
   {TOOL_CLR}/version{C.RESET}   — Show version
   {TOOL_CLR}/quit{C.RESET}      — Exit
 """)
@@ -3755,6 +3917,127 @@ class SclgAI:
             print(f"  {TOOL_CLR}● {name}{C.RESET} — {tool['description'][:60]}")
             print(f"    {DIM_COLOR}params: {', '.join(param_list)}{C.RESET}")
         print(f"\n  {DIM_COLOR}Streaming: {'ON' if self.streaming_enabled else 'OFF'} · Agent loop: max {self.agent_loop_max_turns} turns{C.RESET}")
+        print()
+
+    def _handle_training(self, args):
+        """Handle /train commands: stats, export, merge, test."""
+        sub = args.strip().lower() if args else "stats"
+
+        if sub == "stats":
+            s = self.training.stats()
+            print(f"\n{ACCENT}--- Training Data ---{C.RESET}")
+            print(f"  Total entries: {s.get('total', 0)}")
+            print(f"  Avg quality:   {s.get('avg_quality', 0)}")
+            print(f"  High quality:  {s.get('high_quality', 0)} (>= 0.7)")
+            if s.get('by_expert'):
+                print(f"\n  {C.BOLD}By expert:{C.RESET}")
+                for exp, cnt in sorted(s.get('by_expert', {}).items(), key=lambda x: -x[1]):
+                    print(f"    {exp}: {cnt}")
+            if s.get('by_model'):
+                print(f"\n  {C.BOLD}By model:{C.RESET}")
+                for mod, cnt in sorted(s.get('by_model', {}).items(), key=lambda x: -x[1]):
+                    print(f"    {mod}: {cnt}")
+            print()
+
+        elif sub == "export":
+            print(f"\n{ACCENT}--- Export Modelfile ---{C.RESET}")
+            for expert in MODEL_PROFILES:
+                path, msg = self.training.export_modelfile(expert=expert)
+                status = SYSTEM_CLR + "OK" if path else WARN_CLR + "SKIP"
+                print(f"  {status}{C.RESET} {expert}: {msg}")
+            print()
+
+        elif sub == "merge":
+            print(f"\n{ACCENT}--- Merge Golden Dataset ---{C.RESET}")
+            added = self.training.merge_golden()
+            print(f"  Added {added} golden entries")
+            print()
+
+        elif sub == "test":
+            self._run_training_tests()
+
+        elif sub == "cycle":
+            print(f"\n{ACCENT}--- Full Training Cycle ---{C.RESET}")
+            # Step 1: Merge golden
+            added = self.training.merge_golden()
+            print(f"  1. Merged golden: +{added} entries")
+            # Step 2: Stats
+            s = self.training.stats()
+            print(f"  2. Total: {s.get('total', 0)}, avg quality: {s.get('avg_quality', 0)}")
+            # Step 3: Export
+            exported = 0
+            for expert in MODEL_PROFILES:
+                path, msg = self.training.export_modelfile(expert=expert)
+                if path:
+                    exported += 1
+            print(f"  3. Exported {exported} Modelfiles")
+            # Step 4: Instructions
+            print(f"\n  {C.BOLD}Next steps (run on GPU node):{C.RESET}")
+            print(f"  {DIM_COLOR}cd {self.training.MODELFILE_DIR}")
+            print(f"  ollama create sclg-devops -f Modelfile.sclg-sysadmin")
+            print(f"  ollama create sclg-general -f Modelfile.sclg-general{C.RESET}")
+            print()
+
+        else:
+            print(f"  {WARN_CLR}Usage: /train [stats|export|merge|test|cycle]{C.RESET}")
+
+    def _run_training_tests(self):
+        """Run model understanding tests."""
+        test_file = os.path.join(DATA_DIR, "test_scenarios.json")
+        if not os.path.exists(test_file):
+            print(f"  {WARN_CLR}No test file: {test_file}{C.RESET}")
+            return
+        try:
+            with open(test_file) as f:
+                tests = json.load(f)
+        except Exception as e:
+            print(f"  {ERROR_CLR}Error loading tests: {e}{C.RESET}")
+            return
+
+        print(f"\n{ACCENT}--- Model Understanding Tests ---{C.RESET}")
+        total = 0
+        passed = 0
+        for cat_name, cat in tests.get("categories", {}).items():
+            print(f"\n  {TOOL_CLR}> {cat_name}{C.RESET} - {cat.get('description', '')}")
+            for test in cat.get("tests", []):
+                total += 1
+                query = test["query"]
+                expected = test.get("expected_behavior", "")
+                must_contain = test.get("must_contain", [])
+                must_not_contain = test.get("must_not_contain", [])
+
+                spinner = Spinner(f"Testing: {query[:50]}...", color=DIM_COLOR)
+                spinner.start()
+                try:
+                    result = self.process_query(query)
+                    response = result.get("response", "") if isinstance(result, dict) else str(result)
+                except Exception as e:
+                    response = f"ERROR: {e}"
+                spinner.stop()
+
+                # Check pass/fail
+                ok = True
+                fails = []
+                for mc in must_contain:
+                    if mc.lower() not in response.lower():
+                        ok = False
+                        fails.append(f"missing: {mc}")
+                for mnc in must_not_contain:
+                    if mnc.lower() in response.lower():
+                        ok = False
+                        fails.append(f"found forbidden: {mnc}")
+                if ok:
+                    passed += 1
+                    print(f"    {SYSTEM_CLR}PASS{C.RESET} {query[:60]}")
+                else:
+                    print(f"    {ERROR_CLR}FAIL{C.RESET} {query[:60]}")
+                    for fail in fails:
+                        print(f"         {DIM_COLOR}{fail}{C.RESET}")
+
+        print(f"\n{ACCENT}--- Results ---{C.RESET}")
+        pct = (passed / total * 100) if total > 0 else 0
+        color = SYSTEM_CLR if pct >= 80 else WARN_CLR if pct >= 50 else ERROR_CLR
+        print(f"  {color}{passed}/{total} passed ({pct:.0f}%){C.RESET}")
         print()
 
     def _show_hosts(self):

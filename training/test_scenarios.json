@@ -1,0 +1,152 @@
+{
+  "version": "5.0.1",
+  "description": "Test scenarios for model understanding verification",
+  "categories": {
+    "tool_calling": {
+      "description": "Model should use <tool> tags instead of plain text suggestions",
+      "tests": [
+        {
+          "id": "TC01",
+          "query": "покажи содержимое /etc/hosts",
+          "expected_behavior": "Should use <tool name=\"read_file\"> or <tool name=\"bash\">",
+          "fail_if": "Model suggests 'cat /etc/hosts' as plain text without tool tags",
+          "severity": "critical"
+        },
+        {
+          "id": "TC02",
+          "query": "найди все .log файлы в /var/log",
+          "expected_behavior": "Should use <tool name=\"glob\"> or <tool name=\"bash\">",
+          "fail_if": "Model suggests commands without tool tags",
+          "severity": "critical"
+        },
+        {
+          "id": "TC03",
+          "query": "замени localhost на 10.0.0.229 в /etc/hosts",
+          "expected_behavior": "Should use <tool name=\"apply_patch\"> with find/replace",
+          "fail_if": "Model suggests sed command without tool tags",
+          "severity": "high"
+        },
+        {
+          "id": "TC04",
+          "query": "создай файл /tmp/test.txt с текстом hello world",
+          "expected_behavior": "Should use <tool name=\"write_file\">",
+          "fail_if": "Model suggests echo > or cat > without tool tags",
+          "severity": "high"
+        }
+      ]
+    },
+    "data_analysis": {
+      "description": "Model MUST analyze collected data, never refuse",
+      "tests": [
+        {
+          "id": "DA01",
+          "query": "https://grafana.sclg.io/d/dashboard проверь",
+          "context": "Dashboard data collected via curl: Title: AI Cluster, Panels: CPU, GPU, Memory",
+          "expected_behavior": "Analyze the collected data, show tables with metrics",
+          "fail_if": "Model says 'я не могу проверить URL' or 'проверьте сами'",
+          "severity": "critical"
+        },
+        {
+          "id": "DA02",
+          "query": "что с gpu",
+          "context": "nvidia-smi output: GPU0 temp 78C util 95% mem 22.1/24GB",
+          "expected_behavior": "Analyze GPU data, warn about high temp and utilization",
+          "fail_if": "Model gives generic GPU advice without analyzing actual data",
+          "severity": "critical"
+        },
+        {
+          "id": "DA03",
+          "query": "проверь диски",
+          "context": "df -h output: /dev/sda1 228G 210G 18G 93%",
+          "expected_behavior": "ALERT about 93% disk usage, recommend cleanup",
+          "fail_if": "Model gives generic disk advice without mentioning 93%",
+          "severity": "high"
+        }
+      ]
+    },
+    "anti_refusal": {
+      "description": "Model must NEVER refuse to act",
+      "tests": [
+        {
+          "id": "AR01",
+          "query": "перезапусти nginx",
+          "expected_behavior": "Use tool to restart: <tool name=\"bash\">{\"command\": \"sudo systemctl restart nginx\"}",
+          "fail_if": "Model says 'я не могу перезапустить' or 'у меня нет доступа'",
+          "severity": "critical"
+        },
+        {
+          "id": "AR02",
+          "query": "проверь что на порту 8080",
+          "expected_behavior": "Use tool: <tool name=\"bash\">{\"command\": \"lsof -i :8080\"}",
+          "fail_if": "Model says 'я не могу проверить порт'",
+          "severity": "critical"
+        },
+        {
+          "id": "AR03",
+          "query": "подключись к ai-server по ssh и проверь uptime",
+          "expected_behavior": "Use tool: <tool name=\"bash\">{\"command\": \"ssh ilea@10.0.0.229 uptime\"}",
+          "fail_if": "Model says 'я не могу подключиться по SSH'",
+          "severity": "critical"
+        }
+      ]
+    },
+    "streaming_think_filter": {
+      "description": "Model output should never contain <think> tags",
+      "tests": [
+        {
+          "id": "ST01",
+          "query": "Any query",
+          "expected_behavior": "Response should NOT contain <think>, </think>, <reflection>",
+          "fail_if": "Raw <think> tags visible in output",
+          "severity": "critical"
+        }
+      ]
+    },
+    "context_continuation": {
+      "description": "Model should use conversation context for short queries",
+      "tests": [
+        {
+          "id": "CC01",
+          "query": "подробнее",
+          "context": "Previous: user asked about GPU status, model responded with table",
+          "expected_behavior": "Expand on GPU topic with more details",
+          "fail_if": "Model asks 'о чём подробнее?' or gives unrelated response",
+          "severity": "high"
+        },
+        {
+          "id": "CC02",
+          "query": "а на ai002?",
+          "context": "Previous: user asked about ai-server GPU, model responded",
+          "expected_behavior": "Check GPU on ai002 specifically",
+          "fail_if": "Model doesn't understand reference to ai002",
+          "severity": "medium"
+        }
+      ]
+    },
+    "response_format": {
+      "description": "Responses should follow Claude Code style",
+      "tests": [
+        {
+          "id": "RF01",
+          "query": "Any system query",
+          "expected_behavior": "Response has ## headers, | tables |, ### Вывод section",
+          "fail_if": "Plain text without structure",
+          "severity": "medium"
+        },
+        {
+          "id": "RF02",
+          "query": "Any query",
+          "expected_behavior": "No 'Конечно!', 'Безусловно!', 'Если нужно ещё — обращайтесь!'",
+          "fail_if": "AI-isms present in response",
+          "severity": "low"
+        }
+      ]
+    }
+  },
+  "scoring": {
+    "critical_fail": "Any critical test failure = model needs retraining",
+    "high_fail": "2+ high failures = model needs prompt adjustment",
+    "medium_fail": "Informational, track for improvement",
+    "pass_threshold": "All critical + 80% high tests must pass"
+  }
+}
