@@ -85,7 +85,7 @@ SKILL_CLR   = C.rgb(120, 220, 200)
 
 # ── Configuration ───────────────────────────────────────────────────
 
-VERSION = "5.2.1"
+VERSION = "5.2.2"
 APP_NAME = "Scoliologic AI"
 
 GPU_BALANCER_URL = "http://10.0.0.229:11440"
@@ -186,14 +186,17 @@ MODEL_PROFILES = {
     },
     "sysadmin": {
         "models": ["sclg-devops:27b", "qwen3.5-27b-hf:latest", "gemma4-26b-hf:latest", "phi4:14b", "qwen2.5:14b", "sclg-fast:7b", "mistral:7b"],
-        "keywords": ["сервер", "server", "ssh", "network", "сеть", "firewall",
+        "keywords": ["сервер", "server", "ssh", "network", "сеть", "сети", "сетев", "firewall",
             "iptables", "dns", "ip", "ping", "traceroute", "диск", "disk",
             "memory", "cpu", "gpu", "nvidia", "процесс", "process",
             "kill", "systemctl", "service", "лог", "log", "порт", "port",
             "proxmox", "vm", "vpn", "ssl", "tls", "cert", "сканир", "scan",
             "почини", "исправь", "fix", "проверь", "status", "мониторинг",
             "ollama", "роутер", "router", "mikrotik", "dhcp", "nat",
-            "мис", "mis", "медицинская информационная"],
+            "мис", "mis", "медицинская информационная",
+            "проблем", "ошибк", "упал", "не работает", "не пингуется",
+            "не отвечает", "недоступен", "кластер", "нод", "хост",
+            "алерт", "alert", "grafana", "prometheus", "метрик"],
         "temperature": 0.3,
         "system_hint": "Ты DevOps/SysAdmin эксперт. Выполняй команды и анализируй результаты.",
     },
@@ -383,12 +386,19 @@ SMART_PATTERNS = [
       "echo '=== Recent Alerts ===' && curl -s -H \"Authorization: Bearer $GRAFANA_TOKEN\" \"$GRAFANA_URL/api/alerts\" 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); [print(f'- {a[\\\"name\\\"]} [{a[\\\"state\\\"]}]') for a in d[:10]]\" || echo 'Alerts API недоступен'"],
      "sysadmin"),
 
-    # ── Alerts / Monitoring ──
+    # ── Alerts / Monitoring / Network Problems ──
     (["алерт", "alert", "проверь алерт", "покажи алерт", "тревог",
       "мониторинг", "monitoring", "проверь мониторинг",
       "что с серверами", "статус серверов", "статус кластера",
       "что случилось", "есть проблемы", "всё ли ок", "все ли ок",
-      "check alerts", "show alerts", "any problems", "cluster status"],
+      "check alerts", "show alerts", "any problems", "cluster status",
+      "проблемы в сети", "проблемы сети", "проблемы сегодня",
+      "проблемы за сегодня", "проблемы за день", "проблемы за неделю",
+      "network problems", "network issues", "сетевые проблемы",
+      "что не работает", "что упало", "что сломалось",
+      "проверь сеть", "проверь проблемы", "есть ли проблемы",
+      "покажи проблемы", "покажи ошибки", "ошибки в сети",
+      "ошибки сегодня", "ошибки за сегодня"],
      ["echo '=== Grafana Alerts ===' && curl -s -H \"Authorization: Bearer $GRAFANA_TOKEN\" \"$GRAFANA_URL/api/alertmanager/grafana/api/v2/alerts\" 2>/dev/null | python3 -c \"import sys,json; alerts=json.load(sys.stdin); print(f'Active alerts: {len(alerts)}'); [print(f'  [{a.get(\\\"status\\\",{}).get(\\\"state\\\",\\\"?\\\")]}: {a.get(\\\"labels\\\",{}).get(\\\"alertname\\\",\\\"?\\\")} - {a.get(\\\"annotations\\\",{}).get(\\\"summary\\\",\\\"\\\")}') for a in alerts[:15]]\" 2>/dev/null || echo 'Grafana Alertmanager недоступен'",
       "echo '=== Prometheus Alerts ===' && curl -s 'http://10.0.0.229:9090/api/v1/alerts' 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); alerts=d.get('data',{}).get('alerts',[]); print(f'Prometheus alerts: {len(alerts)}'); [print(f'  [{a[\\\"state\\\"]}] {a[\\\"labels\\\"].get(\\\"alertname\\\",\\\"?\\\")} - {a.get(\\\"annotations\\\",{}).get(\\\"summary\\\",\\\"\\\")}') for a in alerts[:15]]\" 2>/dev/null || echo 'Prometheus недоступен'",
       "echo '=== Node Health ===' && curl -s 'http://10.0.0.229:9090/api/v1/query?query=up' 2>/dev/null | python3 -c \"import sys,json; d=json.load(sys.stdin); results=d.get('data',{}).get('result',[]); [print(f'  {r[\\\"metric\\\"].get(\\\"instance\\\",\\\"?\\\")}: {\\\"UP\\\" if r[\\\"value\\\"][1]==\\\"1\\\" else \\\"DOWN\\\"}') for r in results[:20]]\" 2>/dev/null || echo 'Prometheus недоступен'",
@@ -1503,8 +1513,30 @@ class ToolRegistry:
 
     # ── Tool Implementations ──
 
+    # v5.2.2: Blocked commands that require password or are dangerous
+    BLOCKED_COMMANDS = [
+        "sudo ", "su ", "passwd", "rm -rf /", "mkfs", "dd if=",
+        "tcpdump", "wireshark", "tshark",  # require sudo/root
+        "shutdown", "reboot", "halt", "poweroff",
+        ":(){ :|:& };:",  # fork bomb
+    ]
+
     def _exec_bash(self, command, timeout=30, **_):
-        """Execute a shell command."""
+        """Execute a shell command.
+
+        v5.2.2: Blocks sudo and dangerous commands.
+        """
+        # Check for blocked commands
+        cmd_low = command.lower().strip()
+        for blocked in self.BLOCKED_COMMANDS:
+            if blocked in cmd_low:
+                renderer = CommandRenderer()
+                renderer.show_start(command)
+                renderer.show_done(0, success=False)
+                return ToolResult("bash", False,
+                    f"[BLOCKED] Command '{blocked.strip()}' is not allowed (requires root/dangerous). "
+                    f"Use safe alternatives without sudo.", 0)
+
         renderer = CommandRenderer()
         renderer.show_start(command)
         try:
@@ -2752,7 +2784,7 @@ class SmartExecutor:
 
         # Sysadmin keywords
         sysadmin_kw = [
-            "сервер", "server", "сеть", "network", "порт", "port",
+            "сервер", "server", "сеть", "сети", "сетев", "network", "порт", "port",
             "процесс", "process", "диск", "disk", "память", "memory",
             "cpu", "gpu", "лог", "log", "сервис", "service",
             "docker", "контейнер", "firewall", "dns", "ip",
@@ -2765,6 +2797,9 @@ class SmartExecutor:
             "сканируй", "просканируй", "ollama", "модел",
             "роутер", "router", "mikrotik", "proxmox",
             "vpn", "wireguard", "tailscale",
+            "проблем", "ошибк", "упал", "не работает", "не пингуется",
+            "не отвечает", "недоступен", "алерт", "alert",
+            "grafana", "prometheus", "метрик", "кластер", "нод", "хост",
         ]
         return any(kw in query_low for kw in sysadmin_kw)
 
@@ -3548,9 +3583,13 @@ class SclgAI:
         else:
             response = self._process_agent_commands(response)
 
-        # Step 9: Cache good responses
-        if is_good or (not response.startswith("[ERROR]")):
+        # Step 9: Cache good responses (v5.2.2: don't cache empty/short)
+        response_clean = re.sub(r'<[^>]+>', '', response).strip() if response else ''
+        if (is_good or (not response.startswith("[ERROR]"))) and len(response_clean) > 30:
             self.cache.put(query, response, expert)
+        elif len(response_clean) <= 30:
+            # Don't cache empty/short responses — next query should retry
+            pass
 
         # Step 10: Save for training if good
         if is_good:
