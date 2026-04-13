@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ╔═══════════════════════════════════════════════════════════╗
-║  Scoliologic AI Console (sclg-ai) v4.6.0                 ║
+║  Scoliologic AI Console (sclg-ai) v5.0.0                 ║
 ║  Autonomous DevOps/SysAdmin Agent                        ║
 ║  Execute first, explain later — like Claude Code          ║
 ║                                                           ║
@@ -12,6 +12,7 @@
 ║  - nanobot (Dream memory, skills, lifecycle hooks)        ║
 ║  - avoid-ai-writing (anti-AI-isms post-processor)         ║
 ║  - InfraLearner (background self-learning from Grafana)    ║
+║  - nearai/ironclaw (streaming, tool calling, agent loop)  ║
 ╚═══════════════════════════════════════════════════════════╝
 """
 
@@ -83,7 +84,7 @@ SKILL_CLR   = C.rgb(120, 220, 200)
 
 # ── Configuration ───────────────────────────────────────────────────
 
-VERSION = "4.6.0"
+VERSION = "5.0.0"
 APP_NAME = "Scoliologic AI"
 
 GPU_BALANCER_URL = "http://10.0.0.229:11440"
@@ -1314,6 +1315,522 @@ class ProgressBar(ProgressTracker):
 
 
 # ══════════════════════════════════════════════════════════════════════
+# TOOL REGISTRY — Structured Tool Calling (inspired by nearai/ironclaw)
+# Replaces <cmd> tag parsing with proper tool definitions
+# ══════════════════════════════════════════════════════════════════════
+
+@dataclass
+class ToolResult:
+    """Result of a tool execution."""
+    tool: str
+    success: bool
+    output: str
+    elapsed: float = 0.0
+
+
+class ToolRegistry:
+    """Registry of available tools with JSON-schema definitions.
+
+    Inspired by IronClaw's skill catalog. Each tool has:
+    - name: unique identifier
+    - description: what the tool does
+    - parameters: JSON schema for input
+    - execute: callable that runs the tool
+    """
+
+    def __init__(self):
+        self.tools = {}
+        self._register_builtins()
+
+    def register(self, name, description, parameters, execute_fn):
+        """Register a tool."""
+        self.tools[name] = {
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+            "execute": execute_fn,
+        }
+
+    def _register_builtins(self):
+        """Register built-in tools (bash, file ops)."""
+
+        # ── bash: Execute shell commands ──
+        self.register(
+            name="bash",
+            description="Execute a shell command on the local machine. Use for system administration, monitoring, diagnostics.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string", "description": "Shell command to execute"},
+                    "timeout": {"type": "integer", "description": "Timeout in seconds (default 30)", "default": 30},
+                },
+                "required": ["command"],
+            },
+            execute_fn=self._exec_bash,
+        )
+
+        # ── read_file: Read file contents ──
+        self.register(
+            name="read_file",
+            description="Read the contents of a file. Use to inspect configs, logs, scripts.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute or relative file path"},
+                    "offset": {"type": "integer", "description": "Start line (0-indexed, default 0)", "default": 0},
+                    "limit": {"type": "integer", "description": "Max lines to read (default 200)", "default": 200},
+                },
+                "required": ["path"],
+            },
+            execute_fn=self._exec_read_file,
+        )
+
+        # ── write_file: Create or overwrite a file ──
+        self.register(
+            name="write_file",
+            description="Create a new file or overwrite an existing file with the given content.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to write"},
+                    "content": {"type": "string", "description": "Full file content"},
+                },
+                "required": ["path", "content"],
+            },
+            execute_fn=self._exec_write_file,
+        )
+
+        # ── apply_patch: Edit specific parts of a file ──
+        self.register(
+            name="apply_patch",
+            description="Apply a targeted edit to a file. Finds exact text and replaces it. Preferred over write_file for modifications.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path to edit"},
+                    "find": {"type": "string", "description": "Exact text to find in the file"},
+                    "replace": {"type": "string", "description": "Replacement text"},
+                },
+                "required": ["path", "find", "replace"],
+            },
+            execute_fn=self._exec_apply_patch,
+        )
+
+        # ── glob: Find files by pattern ──
+        self.register(
+            name="glob",
+            description="Find files matching a glob pattern. Returns list of matching file paths.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Glob pattern (e.g. /etc/*.conf, **/*.py)"},
+                    "path": {"type": "string", "description": "Base directory (default: current dir)", "default": "."},
+                },
+                "required": ["pattern"],
+            },
+            execute_fn=self._exec_glob,
+        )
+
+        # ── grep: Search file contents ──
+        self.register(
+            name="grep",
+            description="Search for a regex pattern in files. Returns matching lines with context.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regex pattern to search for"},
+                    "path": {"type": "string", "description": "File or directory to search in"},
+                    "include": {"type": "string", "description": "File glob to include (e.g. *.py)", "default": ""},
+                },
+                "required": ["pattern", "path"],
+            },
+            execute_fn=self._exec_grep,
+        )
+
+        # ── list_dir: List directory contents ──
+        self.register(
+            name="list_dir",
+            description="List contents of a directory with file sizes and types.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path"},
+                },
+                "required": ["path"],
+            },
+            execute_fn=self._exec_list_dir,
+        )
+
+    # ── Tool Implementations ──
+
+    def _exec_bash(self, command, timeout=30, **_):
+        """Execute a shell command."""
+        renderer = CommandRenderer()
+        renderer.show_start(command)
+        try:
+            t0 = time.time()
+            proc = subprocess.run(
+                command, shell=True, capture_output=True, text=True, timeout=timeout
+            )
+            dt = time.time() - t0
+            output = proc.stdout.strip()
+            if proc.stderr.strip():
+                output += ("\n" + proc.stderr.strip()) if output else proc.stderr.strip()
+            success = proc.returncode == 0
+            renderer.show_done(dt, success=success)
+            if output and len(output.split('\n')) > 5:
+                renderer.show_output_preview(output)
+            return ToolResult("bash", success, output or "(no output)", dt)
+        except subprocess.TimeoutExpired:
+            renderer.show_timeout(timeout)
+            return ToolResult("bash", False, f"[TIMEOUT after {timeout}s]", timeout)
+        except Exception as e:
+            renderer.show_done(0, success=False)
+            return ToolResult("bash", False, f"[ERROR: {e}]", 0)
+
+    def _exec_read_file(self, path, offset=0, limit=200, **_):
+        """Read file contents."""
+        renderer = CommandRenderer()
+        renderer.show_start(f"read_file {path}")
+        t0 = time.time()
+        try:
+            path = os.path.expanduser(path)
+            if not os.path.exists(path):
+                renderer.show_done(time.time() - t0, success=False)
+                return ToolResult("read_file", False, f"File not found: {path}", time.time() - t0)
+            if os.path.getsize(path) > 2 * 1024 * 1024:  # 2MB limit
+                renderer.show_done(time.time() - t0, success=False)
+                return ToolResult("read_file", False, f"File too large: {os.path.getsize(path)} bytes (max 2MB)", time.time() - t0)
+            with open(path, 'r', errors='replace') as f:
+                lines = f.readlines()
+            total = len(lines)
+            selected = lines[offset:offset + limit]
+            content = ''.join(selected)
+            dt = time.time() - t0
+            renderer.show_done(dt, success=True)
+            header = f"[{path}] lines {offset+1}-{min(offset+limit, total)} of {total}\n"
+            return ToolResult("read_file", True, header + content, dt)
+        except Exception as e:
+            dt = time.time() - t0
+            renderer.show_done(dt, success=False)
+            return ToolResult("read_file", False, f"[ERROR: {e}]", dt)
+
+    def _exec_write_file(self, path, content, **_):
+        """Write content to a file."""
+        renderer = CommandRenderer()
+        renderer.show_start(f"write_file {path}")
+        t0 = time.time()
+        try:
+            path = os.path.expanduser(path)
+            os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+            with open(path, 'w') as f:
+                f.write(content)
+            dt = time.time() - t0
+            renderer.show_done(dt, success=True)
+            lines = content.count('\n') + 1
+            return ToolResult("write_file", True, f"Wrote {lines} lines to {path}", dt)
+        except Exception as e:
+            dt = time.time() - t0
+            renderer.show_done(dt, success=False)
+            return ToolResult("write_file", False, f"[ERROR: {e}]", dt)
+
+    def _exec_apply_patch(self, path, find, replace, **_):
+        """Apply a targeted edit to a file."""
+        renderer = CommandRenderer()
+        renderer.show_start(f"apply_patch {path}")
+        t0 = time.time()
+        try:
+            path = os.path.expanduser(path)
+            if not os.path.exists(path):
+                renderer.show_done(time.time() - t0, success=False)
+                return ToolResult("apply_patch", False, f"File not found: {path}", time.time() - t0)
+            with open(path, 'r') as f:
+                original = f.read()
+            if find not in original:
+                renderer.show_done(time.time() - t0, success=False)
+                return ToolResult("apply_patch", False, f"Text to find not found in {path}", time.time() - t0)
+            updated = original.replace(find, replace, 1)
+            with open(path, 'w') as f:
+                f.write(updated)
+            dt = time.time() - t0
+            renderer.show_done(dt, success=True)
+            return ToolResult("apply_patch", True, f"Patched {path} successfully", dt)
+        except Exception as e:
+            dt = time.time() - t0
+            renderer.show_done(dt, success=False)
+            return ToolResult("apply_patch", False, f"[ERROR: {e}]", dt)
+
+    def _exec_glob(self, pattern, path=".", **_):
+        """Find files matching a glob pattern."""
+        renderer = CommandRenderer()
+        renderer.show_start(f"glob {pattern}")
+        t0 = time.time()
+        try:
+            import glob as glob_mod
+            base = os.path.expanduser(path)
+            full_pattern = os.path.join(base, pattern) if not os.path.isabs(pattern) else pattern
+            matches = sorted(glob_mod.glob(full_pattern, recursive=True))[:100]
+            dt = time.time() - t0
+            renderer.show_done(dt, success=True)
+            if matches:
+                return ToolResult("glob", True, f"Found {len(matches)} files:\n" + '\n'.join(matches), dt)
+            return ToolResult("glob", True, "No files matched", dt)
+        except Exception as e:
+            dt = time.time() - t0
+            renderer.show_done(dt, success=False)
+            return ToolResult("glob", False, f"[ERROR: {e}]", dt)
+
+    def _exec_grep(self, pattern, path, include="", **_):
+        """Search for a regex pattern in files."""
+        renderer = CommandRenderer()
+        renderer.show_start(f"grep '{pattern}' {path}")
+        t0 = time.time()
+        try:
+            cmd = f"grep -rn --color=never"
+            if include:
+                cmd += f" --include='{include}'"
+            cmd += f" '{pattern}' {path} 2>/dev/null | head -50"
+            proc = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
+            dt = time.time() - t0
+            output = proc.stdout.strip()
+            renderer.show_done(dt, success=bool(output))
+            if output and len(output.split('\n')) > 5:
+                renderer.show_output_preview(output)
+            return ToolResult("grep", True, output or "No matches found", dt)
+        except Exception as e:
+            dt = time.time() - t0
+            renderer.show_done(dt, success=False)
+            return ToolResult("grep", False, f"[ERROR: {e}]", dt)
+
+    def _exec_list_dir(self, path, **_):
+        """List directory contents."""
+        renderer = CommandRenderer()
+        renderer.show_start(f"list_dir {path}")
+        t0 = time.time()
+        try:
+            path = os.path.expanduser(path)
+            if not os.path.isdir(path):
+                renderer.show_done(time.time() - t0, success=False)
+                return ToolResult("list_dir", False, f"Not a directory: {path}", time.time() - t0)
+            entries = []
+            for entry in sorted(os.listdir(path)):
+                full = os.path.join(path, entry)
+                if os.path.isdir(full):
+                    entries.append(f"  {entry}/")
+                else:
+                    try:
+                        size = os.path.getsize(full)
+                        if size > 1024 * 1024:
+                            size_str = f"{size / 1024 / 1024:.1f}M"
+                        elif size > 1024:
+                            size_str = f"{size / 1024:.1f}K"
+                        else:
+                            size_str = f"{size}B"
+                        entries.append(f"  {entry} ({size_str})")
+                    except OSError:
+                        entries.append(f"  {entry}")
+            dt = time.time() - t0
+            renderer.show_done(dt, success=True)
+            return ToolResult("list_dir", True, f"{path}/\n" + '\n'.join(entries[:100]), dt)
+        except Exception as e:
+            dt = time.time() - t0
+            renderer.show_done(dt, success=False)
+            return ToolResult("list_dir", False, f"[ERROR: {e}]", dt)
+
+    def get_tool_definitions(self):
+        """Get tool definitions in OpenAI function-calling format for the system prompt."""
+        defs = []
+        for name, tool in self.tools.items():
+            defs.append({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": tool["description"],
+                    "parameters": tool["parameters"],
+                }
+            })
+        return defs
+
+    def get_tools_prompt(self):
+        """Get a text description of available tools for the system prompt.
+        Used when the model doesn't support native function calling."""
+        lines = ["\nДОСТУПНЫЕ ИНСТРУМЕНТЫ (tool calling):"]
+        lines.append("Вместо <cmd> тегов используй структурированные вызовы инструментов:")
+        lines.append("")
+        for name, tool in self.tools.items():
+            params = tool["parameters"].get("properties", {})
+            required = tool["parameters"].get("required", [])
+            param_strs = []
+            for pname, pdef in params.items():
+                req = "*" if pname in required else ""
+                param_strs.append(f"{pname}{req}: {pdef.get('description', '')}")
+            lines.append(f"  • {name}: {tool['description']}")
+            lines.append(f"    Параметры: {', '.join(param_strs)}")
+            lines.append(f'    Формат: <tool name="{name}">{{"param": "value"}}</tool>')
+            lines.append("")
+        lines.append("ПРИМЕРЫ:")
+        lines.append('<tool name="bash">{"command": "df -h"}</tool>')
+        lines.append('<tool name="read_file">{"path": "/etc/nginx/nginx.conf"}</tool>')
+        lines.append('<tool name="write_file">{"path": "/tmp/test.sh", "content": "#!/bin/bash\\necho hello"}</tool>')
+        lines.append('<tool name="apply_patch">{"path": "/etc/hosts", "find": "old-host", "replace": "new-host"}</tool>')
+        lines.append('<tool name="grep">{"pattern": "error|fail", "path": "/var/log/", "include": "*.log"}</tool>')
+        lines.append('<tool name="list_dir">{"path": "/etc/nginx/"}</tool>')
+        lines.append("")
+        lines.append("ВАЖНО: Ты можешь вызывать несколько инструментов в одном ответе.")
+        lines.append("После каждого вызова ты получишь результат и сможешь продолжить анализ или вызвать следующий инструмент.")
+        lines.append("Также поддерживается старый формат: <cmd>команда</cmd> (автоматически конвертируется в bash tool).")
+        return '\n'.join(lines)
+
+    def execute_tool(self, name, params):
+        """Execute a tool by name with given parameters."""
+        tool = self.tools.get(name)
+        if not tool:
+            return ToolResult(name, False, f"Unknown tool: {name}", 0)
+        try:
+            return tool["execute"](**params)
+        except TypeError as e:
+            return ToolResult(name, False, f"Invalid parameters for {name}: {e}", 0)
+        except Exception as e:
+            return ToolResult(name, False, f"Tool {name} error: {e}", 0)
+
+    def parse_tool_calls(self, response_text):
+        """Parse tool calls from AI response text.
+
+        Supports two formats:
+        1. New: <tool name="bash">{"command": "ls"}</tool>
+        2. Legacy: <cmd>ls</cmd> (auto-converted to bash tool)
+
+        Returns list of (tool_name, params_dict) tuples.
+        """
+        calls = []
+
+        # Parse new format: <tool name="...">...</tool>
+        tool_pattern = re.compile(r'<tool\s+name="(\w+)">(.*?)</tool>', re.DOTALL)
+        for match in tool_pattern.finditer(response_text):
+            tool_name = match.group(1)
+            params_raw = match.group(2).strip()
+            try:
+                params = json.loads(params_raw)
+            except json.JSONDecodeError:
+                # If not valid JSON, treat as command for bash
+                params = {"command": params_raw}
+            calls.append((tool_name, params))
+
+        # Parse legacy format: <cmd>...</cmd> (backward compatible)
+        cmd_pattern = re.compile(r'<cmd>(.*?)</cmd>', re.DOTALL)
+        for match in cmd_pattern.finditer(response_text):
+            cmd = match.group(1).strip()
+            if cmd:
+                # Check if this command was already captured as a tool call
+                already = any(p.get("command") == cmd for _, p in calls if _ == "bash")
+                if not already:
+                    calls.append(("bash", {"command": cmd}))
+
+        return calls
+
+
+# ══════════════════════════════════════════════════════════════════════
+# STREAM RENDERER — Real-time token streaming display
+# Inspired by Claude Code and IronClaw's event_tx broadcast
+# ══════════════════════════════════════════════════════════════════════
+
+class StreamRenderer:
+    """Renders streaming LLM output token-by-token with live formatting.
+
+    Handles:
+    - Real-time token display as they arrive
+    - Code block detection and formatting
+    - Tool call detection mid-stream
+    - Graceful interruption (Ctrl+C)
+    """
+
+    def __init__(self, formatter=None):
+        self.formatter = formatter
+        self._buffer = ""
+        self._line_buffer = ""
+        self._in_code_block = False
+        self._in_tool_call = False
+        self._tool_buffer = ""
+        self._interrupted = False
+        self._token_count = 0
+
+    def feed(self, token):
+        """Feed a single token from the stream.
+
+        Returns:
+            None normally, or a string if a complete tool call was detected.
+        """
+        if self._interrupted:
+            return None
+
+        self._buffer += token
+        self._line_buffer += token
+        self._token_count += 1
+
+        # Check for tool call start
+        if '<tool ' in self._line_buffer or '<cmd>' in self._line_buffer:
+            self._in_tool_call = True
+            # Don't print tool calls — collect them silently
+            # Find the start of the tool tag
+            for tag in ['<tool ', '<cmd>']:
+                idx = self._line_buffer.find(tag)
+                if idx >= 0:
+                    # Print everything before the tag
+                    before = self._line_buffer[:idx]
+                    if before:
+                        sys.stdout.write(before)
+                        sys.stdout.flush()
+                    self._tool_buffer = self._line_buffer[idx:]
+                    self._line_buffer = ""
+                    return None
+
+        # If we're inside a tool call, accumulate silently
+        if self._in_tool_call:
+            self._tool_buffer += token
+            self._line_buffer = ""
+            # Check if tool call is complete
+            if '</tool>' in self._tool_buffer or '</cmd>' in self._tool_buffer:
+                self._in_tool_call = False
+                tool_text = self._tool_buffer
+                self._tool_buffer = ""
+                return tool_text  # Signal: tool call detected
+            return None
+
+        # Regular streaming output
+        # Check for code block boundaries
+        if '```' in self._line_buffer:
+            self._in_code_block = not self._in_code_block
+
+        # Print token immediately
+        sys.stdout.write(token)
+        sys.stdout.flush()
+
+        # Reset line buffer on newlines
+        if '\n' in token:
+            self._line_buffer = ""
+
+        return None
+
+    def interrupt(self):
+        """Signal interruption (Ctrl+C)."""
+        self._interrupted = True
+
+    def get_full_response(self):
+        """Get the complete accumulated response."""
+        return self._buffer
+
+    def get_token_count(self):
+        """Get number of tokens received."""
+        return self._token_count
+
+    def finish(self):
+        """Finish streaming — ensure newline at end."""
+        if self._line_buffer and not self._line_buffer.endswith('\n'):
+            sys.stdout.write('\n')
+            sys.stdout.flush()
+
+
+# ══════════════════════════════════════════════════════════════════════
 # OLLAMA CLIENT — Connects to GPU Balancer or direct nodes
 # ══════════════════════════════════════════════════════════════════════
 
@@ -1474,6 +1991,83 @@ class OllamaClient:
                     time.sleep(2)
 
         return f"[ERROR] Ollama chat failed after {retries} attempts: {last_error}"
+
+    def chat_stream(self, model, messages, system="", temperature=0.5, max_tokens=1500, on_token=None):
+        """Streaming chat completion from Ollama.
+
+        Yields tokens one at a time via on_token callback.
+        Falls back to non-streaming if streaming fails.
+
+        Args:
+            on_token: callable(token_str) called for each token
+        Returns:
+            Full accumulated response string
+        """
+        msgs = []
+        if system:
+            msgs.append({"role": "system", "content": system})
+        msgs.extend(messages)
+
+        if len(msgs) > 8:
+            system_msgs = [m for m in msgs if m.get('role') == 'system']
+            other_msgs = [m for m in msgs if m.get('role') != 'system']
+            msgs = system_msgs + other_msgs[-6:]
+
+        payload = {
+            "model": model,
+            "messages": msgs,
+            "stream": True,
+            "options": {
+                "temperature": temperature,
+                "num_predict": max_tokens,
+                "stop": self._get_stop_tokens(model),
+                "repeat_penalty": 1.15,
+            }
+        }
+
+        data = json.dumps(payload).encode()
+        full_response = ""
+
+        try:
+            req = urllib.request.Request(
+                f"{self.base_url}/api/chat",
+                data=data,
+                headers={"Content-Type": "application/json"},
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                # Ollama streams NDJSON — one JSON object per line
+                buffer = b""
+                while True:
+                    chunk = resp.read(1)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    if chunk == b"\n":
+                        line = buffer.strip()
+                        buffer = b""
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line.decode())
+                            token = obj.get("message", {}).get("content", "")
+                            if token:
+                                full_response += token
+                                if on_token:
+                                    on_token(token)
+                            # Check if done
+                            if obj.get("done", False):
+                                break
+                        except json.JSONDecodeError:
+                            continue
+
+            return full_response if full_response else "[ERROR] Empty streaming response"
+
+        except Exception as e:
+            # Fallback to non-streaming
+            if full_response:
+                return full_response  # Return partial response
+            return self.chat(model, messages, system, temperature, max_tokens, stream=False)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -2243,6 +2837,8 @@ class SclgAI:
         self.training = TrainingCollector()
         self.learner = InfraLearnerBridge()
         self.formatter = OutputFormatter()
+        self.tool_registry = ToolRegistry()
+        self.stream_renderer = None  # Created per-query
 
         # State
         self.conversation = []
@@ -2250,6 +2846,8 @@ class SclgAI:
         self.current_expert = None
         self.auto_route = True
         self.agent_mode = True
+        self.streaming_enabled = True  # v5.0.0: streaming by default
+        self.agent_loop_max_turns = 5  # v5.0.0: max agent loop iterations
         self.claude_ok = False
         self.ollama_ok = False
         self.model_count = 0
@@ -2326,7 +2924,7 @@ class SclgAI:
 
 ПРАВИЛА:
 1. НИКОГДА не говори "я не могу выполнить" или "у меня нет доступа" — ты МОЖЕШЬ.
-2. Если нужно выполнить команду — генерируй её в теге <cmd>команда</cmd>
+2. Для выполнения команд используй инструменты (tools) — см. список ниже.
 3. Если данные уже собраны — АНАЛИЗИРУЙ их, не говори "я не могу".
 4. Отвечай КРАТКО и ПО ДЕЛУ. Без воды.
 5. Используй русский язык по умолчанию.
@@ -2400,6 +2998,9 @@ class SclgAI:
 НЕ пиши curl команды для Grafana — данные уже собраны автоматически.
 Формат: краткий ответ с таблицами и выводами, а не копипаст команд.
 """
+
+        # Add available tools description
+        base += self.tool_registry.get_tools_prompt()
 
         return base
 
@@ -2494,13 +3095,36 @@ class SclgAI:
                 ])
             data_context = self.executor.execute(generic_cmds)
 
-        # Step 5: Get AI response (with spinner)
-        spinner = Spinner("Analyzing", color=ACCENT2)
-        spinner.start()
-        try:
-            response = self._get_ai_response(query, expert, data_context, spinner=spinner)
-        finally:
-            spinner.stop()
+        # Step 5: Get AI response — v5.0.0 uses agent loop for multi-turn
+        use_agent_loop = self.agent_mode and not data_context
+
+        if use_agent_loop:
+            # Agent loop: model can call tools and iterate
+            spinner = Spinner("Agent thinking", color=ACCENT2)
+            spinner.start()
+            try:
+                if self.streaming_enabled:
+                    spinner.stop(f"{expert} → {self.current_model or 'auto'}")
+                response = self._agent_loop(query, expert, data_context)
+            except Exception as e:
+                response = f"[ERROR] Agent loop failed: {e}"
+            finally:
+                if not self.streaming_enabled:
+                    spinner.stop()
+        else:
+            # Classic mode: execute-first + single AI call
+            spinner = Spinner("Analyzing", color=ACCENT2)
+            spinner.start()
+            try:
+                response = self._get_ai_response(query, expert, data_context, spinner=spinner)
+            finally:
+                if not self.streaming_enabled:
+                    spinner.stop()
+                else:
+                    try:
+                        spinner.stop()
+                    except Exception:
+                        pass
 
         # Step 6: Quality check
         is_good, reason = self.quality.check(response, query)
@@ -2514,13 +3138,11 @@ class SclgAI:
                     response = self._claude_fallback(query, data_context, expert)
                 finally:
                     claude_spinner.stop(f"Claude responded")
-                # If Claude also failed (529/overloaded), fall back to raw data
                 if response.startswith("[ERROR]") and data_context:
                     response = self._format_raw_data(query, data_context)
                 else:
                     self.stats.record(expert, "claude", used_claude=True)
             else:
-                # No Claude available — format data nicely as fallback
                 if data_context:
                     response = self._format_raw_data(query, data_context)
         else:
@@ -2530,7 +3152,7 @@ class SclgAI:
         # Step 7: Clean response (anti-AI-isms)
         response = self.cleaner.clean(response)
 
-        # Step 8: Process agent commands in response
+        # Step 8: Process remaining agent commands in response (legacy + new)
         response = self._process_agent_commands(response)
 
         # Step 9: Cache good responses
@@ -2593,12 +3215,15 @@ class SclgAI:
             return f"[ERROR: {e}]"
 
     def _get_ai_response(self, query, expert, data_context="", spinner=None):
-        """Get response from AI model (local or Claude) with spinner updates."""
+        """Get response from AI model (local or Claude).
+
+        v5.0.0: Supports streaming mode. When streaming is enabled,
+        tokens are displayed in real-time via StreamRenderer.
+        """
         system_prompt = self._build_system_prompt(expert, data_context)
 
         # Build messages
         messages = []
-        # Add last 6 conversation turns for context
         for msg in self.conversation[-6:]:
             messages.append(msg)
         messages.append({"role": "user", "content": query})
@@ -2614,26 +3239,40 @@ class SclgAI:
                 if spinner:
                     spinner.update(f"{expert} → {model_short}")
 
-                response = self.ollama.chat(
-                    model=model,
-                    messages=messages,
-                    system=system_prompt,
-                    temperature=config["temperature"],
-                )
-
-                if response and not response.startswith("[ERROR]"):
-                    return response
-                else:
-                    # First model failed — try a smaller/faster model
+                # v5.0.0: Streaming mode
+                if self.streaming_enabled:
                     if spinner:
-                        spinner.update(f"{model_short} failed, trying fallback...")
-                    fallback_models = ["sclg-fast:7b", "qwen2.5:7b", "phi4:14b", "llama3.1:8b", "mistral:7b"]
-                    fallback_model = self.ollama.find_best_model(fallback_models)
-                    if fallback_model and fallback_model != model:
-                        fb_short = fallback_model.split(":")[0] if ":" in fallback_model else fallback_model
-                        if spinner:
-                            spinner.update(f"retry → {fb_short}")
-                        self.current_model = fallback_model
+                        spinner.stop(f"{expert} → {model_short}")
+                    response = self._stream_response(
+                        model, messages, system_prompt, config["temperature"]
+                    )
+                    if response and not response.startswith("[ERROR]"):
+                        return response
+                else:
+                    response = self.ollama.chat(
+                        model=model,
+                        messages=messages,
+                        system=system_prompt,
+                        temperature=config["temperature"],
+                    )
+                    if response and not response.startswith("[ERROR]"):
+                        return response
+
+                # First model failed — try a smaller/faster model
+                if spinner and not self.streaming_enabled:
+                    spinner.update(f"{model_short} failed, trying fallback...")
+                fallback_models = ["sclg-fast:7b", "qwen2.5:7b", "phi4:14b", "llama3.1:8b", "mistral:7b"]
+                fallback_model = self.ollama.find_best_model(fallback_models)
+                if fallback_model and fallback_model != model:
+                    fb_short = fallback_model.split(":")[0] if ":" in fallback_model else fallback_model
+                    if spinner and not self.streaming_enabled:
+                        spinner.update(f"retry → {fb_short}")
+                    self.current_model = fallback_model
+                    if self.streaming_enabled:
+                        response = self._stream_response(
+                            fallback_model, messages, system_prompt, config["temperature"]
+                        )
+                    else:
                         response = self.ollama.chat(
                             model=fallback_model,
                             messages=messages,
@@ -2641,15 +3280,14 @@ class SclgAI:
                             temperature=config["temperature"],
                             retries=1,
                         )
-                        if response and not response.startswith("[ERROR]"):
-                            return response
+                    if response and not response.startswith("[ERROR]"):
+                        return response
 
         # Fallback to Claude
         if self.claude_ok and self.claude.can_use():
             if spinner:
                 spinner.update("Claude fallback")
             claude_response = self._claude_fallback(query, data_context, expert)
-            # If Claude also failed (529/overloaded), don't return error — try raw data
             if claude_response and not claude_response.startswith("[ERROR]"):
                 return claude_response
             else:
@@ -2661,6 +3299,52 @@ class SclgAI:
             return self._format_raw_data(query, data_context)
 
         return "[ERROR] No AI models available. Check GPU Balancer and Claude API."
+
+    def _stream_response(self, model, messages, system_prompt, temperature):
+        """Stream AI response with real-time token display.
+
+        v5.0.0: Tokens appear live as they are generated.
+        Tool calls are detected mid-stream and collected silently.
+        """
+        renderer = StreamRenderer(self.formatter)
+        self.stream_renderer = renderer
+        pending_tool_calls = []
+
+        print()  # Blank line before streaming output
+
+        def on_token(token):
+            result = renderer.feed(token)
+            if result:
+                # Tool call detected mid-stream
+                pending_tool_calls.append(result)
+
+        try:
+            response = self.ollama.chat_stream(
+                model=model,
+                messages=messages,
+                system=system_prompt,
+                temperature=temperature,
+                on_token=on_token,
+            )
+        except KeyboardInterrupt:
+            renderer.interrupt()
+            response = renderer.get_full_response()
+            print(f"\n  {DIM_COLOR}(interrupted){C.RESET}")
+        finally:
+            renderer.finish()
+            self.stream_renderer = None
+
+        # Process any tool calls detected during streaming
+        if pending_tool_calls:
+            for tool_text in pending_tool_calls:
+                calls = self.tool_registry.parse_tool_calls(tool_text)
+                for tool_name, params in calls:
+                    result = self.tool_registry.execute_tool(tool_name, params)
+                    if result.output:
+                        # Append tool result to response
+                        response += f"\n```\n$ {tool_name}: {params}\n{result.output}\n```"
+
+        return response
 
     def _format_raw_data(self, query, data_context):
         """Format raw command output nicely when AI is unavailable."""
@@ -2713,52 +3397,166 @@ class SclgAI:
         return response
 
     def _process_agent_commands(self, response):
-        """Process <cmd>...</cmd> tags in AI response — execute with Claude Code style."""
-        cmd_pattern = re.compile(r'<cmd>(.*?)</cmd>', re.DOTALL)
-        matches = cmd_pattern.findall(response)
+        """Process tool calls and legacy <cmd> tags in AI response.
 
-        if not matches:
+        v5.0.0: Supports both new <tool> format and legacy <cmd> format.
+        Uses ToolRegistry for structured execution.
+        """
+        calls = self.tool_registry.parse_tool_calls(response)
+
+        if not calls:
             return response
 
-        renderer = CommandRenderer()
         result_text = response
-        for cmd in matches:
-            cmd = cmd.strip()
-            if not cmd:
-                continue
+        tool_results = []
 
-            renderer.show_start(cmd)
+        for tool_name, params in calls:
+            result = self.tool_registry.execute_tool(tool_name, params)
+            tool_results.append(result)
 
-            try:
-                t0 = time.time()
-                proc = subprocess.run(
-                    cmd, shell=True, capture_output=True, text=True, timeout=30
-                )
-                dt = time.time() - t0
-                output = proc.stdout.strip()
-                if proc.stderr.strip():
-                    output += f"\n{proc.stderr.strip()}" if output else proc.stderr.strip()
-
-                success = proc.returncode == 0
-                renderer.show_done(dt, success=success)
-                if output and len(output.split('\n')) > 5:
-                    renderer.show_output_preview(output)
-
-                # Replace the <cmd> tag with the output
-                tag = f"<cmd>{cmd}</cmd>"
-                replacement = f"```\n$ {cmd}\n{output}\n```"
-                result_text = result_text.replace(tag, replacement, 1)
-
-            except subprocess.TimeoutExpired:
-                renderer.show_timeout(30)
-                tag = f"<cmd>{cmd}</cmd>"
-                result_text = result_text.replace(tag, f"```\n$ {cmd}\n[TIMEOUT]\n```", 1)
-            except Exception as e:
-                renderer.show_done(0, success=False)
-                tag = f"<cmd>{cmd}</cmd>"
-                result_text = result_text.replace(tag, f"```\n$ {cmd}\n[ERROR: {e}]\n```", 1)
+            # Replace the tool call tag with formatted output
+            if tool_name == "bash":
+                cmd = params.get("command", "")
+                # Try to replace both new and legacy format
+                new_tag = f'<tool name="bash">{json.dumps(params)}</tool>'
+                legacy_tag = f"<cmd>{cmd}</cmd>"
+                replacement = f"```\n$ {cmd}\n{result.output}\n```"
+                if new_tag in result_text:
+                    result_text = result_text.replace(new_tag, replacement, 1)
+                elif legacy_tag in result_text:
+                    result_text = result_text.replace(legacy_tag, replacement, 1)
+                else:
+                    # Fuzzy match — try to find the tag
+                    result_text += f"\n{replacement}"
+            else:
+                # Non-bash tools
+                tag_pattern = f'<tool name="{tool_name}">' + re.escape(json.dumps(params)) + '</tool>'
+                replacement = f"```\n[{tool_name}] {result.output[:500]}\n```"
+                # Try exact match first
+                exact_tag = f'<tool name="{tool_name}">{json.dumps(params)}</tool>'
+                if exact_tag in result_text:
+                    result_text = result_text.replace(exact_tag, replacement, 1)
+                else:
+                    # Try regex match for the tool tag
+                    tag_re = re.compile(f'<tool name="{re.escape(tool_name)}">(.*?)</tool>', re.DOTALL)
+                    match = tag_re.search(result_text)
+                    if match:
+                        result_text = result_text.replace(match.group(0), replacement, 1)
+                    else:
+                        result_text += f"\n{replacement}"
 
         return result_text
+
+    def _agent_loop(self, query, expert, data_context=""):
+        """Multi-turn agent loop — the AI can call tools and continue reasoning.
+
+        v5.0.0: Inspired by IronClaw's loop_engine.
+        The model generates a response, we execute any tool calls,
+        feed results back, and let the model continue until it's done
+        or we hit max turns.
+
+        This replaces the old single-shot process_query + _process_agent_commands flow.
+        """
+        system_prompt = self._build_system_prompt(expert, data_context)
+
+        # Build initial messages
+        messages = []
+        for msg in self.conversation[-6:]:
+            messages.append(msg)
+
+        # If we have pre-collected data, include it in the user message
+        if data_context:
+            user_msg = f"{query}\n\nСобранные данные:\n{data_context}"
+        else:
+            user_msg = query
+        messages.append({"role": "user", "content": user_msg})
+
+        full_response = ""
+        turn = 0
+
+        while turn < self.agent_loop_max_turns:
+            turn += 1
+
+            # Get AI response
+            if self.ollama_ok:
+                config = self.router.get_model_and_config(expert, self.ollama)
+                model = config["model"]
+                if model:
+                    self.current_model = model
+                    model_short = model.split(":")[0] if ":" in model else model
+
+                    if self.streaming_enabled and turn == 1:
+                        # Stream first turn only
+                        response = self._stream_response(
+                            model, messages, system_prompt, config["temperature"]
+                        )
+                    else:
+                        if turn > 1:
+                            turn_spinner = Spinner(f"Agent thinking (turn {turn})", color=ACCENT2)
+                            turn_spinner.start()
+                        response = self.ollama.chat(
+                            model=model,
+                            messages=messages,
+                            system=system_prompt,
+                            temperature=config["temperature"],
+                        )
+                        if turn > 1:
+                            turn_spinner.stop(f"Turn {turn} complete")
+                else:
+                    break
+            elif self.claude_ok and self.claude.can_use():
+                self.current_model = "claude"
+                response = self.claude.chat(messages=messages, system=system_prompt)
+            else:
+                break
+
+            if not response or response.startswith("[ERROR]"):
+                break
+
+            # Parse tool calls from response
+            calls = self.tool_registry.parse_tool_calls(response)
+
+            if not calls:
+                # No tool calls — model is done thinking
+                full_response += response
+                break
+
+            # Execute tool calls and collect results
+            tool_outputs = []
+            for tool_name, params in calls:
+                result = self.tool_registry.execute_tool(tool_name, params)
+                tool_outputs.append(f"[{tool_name}] {result.output}")
+
+            # Strip tool call tags from the response text for display
+            display_response = response
+            for tool_name, params in calls:
+                # Remove <tool> tags
+                display_response = re.sub(
+                    f'<tool name="{re.escape(tool_name)}">(.*?)</tool>',
+                    '', display_response, flags=re.DOTALL
+                )
+                # Remove legacy <cmd> tags
+                display_response = re.sub(r'<cmd>(.*?)</cmd>', '', display_response, flags=re.DOTALL)
+
+            display_response = display_response.strip()
+            if display_response:
+                full_response += display_response + "\n"
+
+            # Feed tool results back to the model
+            messages.append({"role": "assistant", "content": response})
+            tool_result_msg = "\n".join(tool_outputs)
+            messages.append({"role": "user", "content": f"Результаты инструментов:\n{tool_result_msg}\n\nПроанализируй результаты и продолжи. Если нужно больше данных — вызови ещё инструменты. Если достаточно — дай финальный ответ."})
+
+            # Print turn indicator
+            if not self.streaming_enabled:
+                print(f"  {DIM_COLOR}↻ Agent loop turn {turn}/{self.agent_loop_max_turns} — {len(calls)} tool(s) executed{C.RESET}")
+
+        if not full_response:
+            if data_context:
+                return self._format_raw_data(query, data_context)
+            return "[ERROR] Agent loop produced no response."
+
+        return full_response
 
     def _auto_remember(self, query, response):
         """Auto-remember important facts from conversation."""
@@ -2813,6 +3611,12 @@ class SclgAI:
             self._show_gpu()
         elif command in ("/grafana", "/graf"):
             self._show_grafana()
+        elif command in ("/stream",):
+            self.streaming_enabled = not self.streaming_enabled
+            state = "ON" if self.streaming_enabled else "OFF"
+            print(f"  {SYSTEM_CLR}Streaming: {state}{C.RESET}")
+        elif command in ("/tools",):
+            self._show_tools()
         elif command in ("/version", "/v"):
             print(f"  sclg-ai v{VERSION}")
         elif command in ("/quit", "/q", "/exit"):
@@ -2838,6 +3642,8 @@ class SclgAI:
   {TOOL_CLR}/grafana{C.RESET}   — Show Grafana dashboards
   {TOOL_CLR}/clear{C.RESET}     — Clear conversation
   {TOOL_CLR}/new{C.RESET}       — New session (consolidate memory)
+  {TOOL_CLR}/stream{C.RESET}    — Toggle streaming mode (live token output)
+  {TOOL_CLR}/tools{C.RESET}     — Show available agent tools
   {TOOL_CLR}/version{C.RESET}   — Show version
   {TOOL_CLR}/quit{C.RESET}      — Exit
 """)
@@ -2854,6 +3660,21 @@ class SclgAI:
         if self.claude_ok:
             r = self.claude.remaining_today()
             print(f"\n  {CLAUDE_CLR}Claude: {r}/{CLAUDE_DAILY_LIMIT} remaining today{C.RESET}")
+
+    def _show_tools(self):
+        """Show available agent tools."""
+        print(f"\n{ACCENT}━━━ Agent Tools (v5.0.0) ━━━{C.RESET}")
+        for name, tool in self.tool_registry.tools.items():
+            params = tool["parameters"].get("properties", {})
+            required = tool["parameters"].get("required", [])
+            param_list = []
+            for pname, pdef in params.items():
+                req_mark = "*" if pname in required else ""
+                param_list.append(f"{pname}{req_mark}")
+            print(f"  {TOOL_CLR}● {name}{C.RESET} — {tool['description'][:60]}")
+            print(f"    {DIM_COLOR}params: {', '.join(param_list)}{C.RESET}")
+        print(f"\n  {DIM_COLOR}Streaming: {'ON' if self.streaming_enabled else 'OFF'} · Agent loop: max {self.agent_loop_max_turns} turns{C.RESET}")
+        print()
 
     def _show_hosts(self):
         host_spinner = Spinner("Checking hosts", color=TOOL_CLR, style="dots")
@@ -3310,11 +4131,18 @@ class SclgAI:
 
                 elapsed = time.time() - start_time
 
-                # Display response with typewriter effect (Claude Code style)
-                formatted = self.formatter.format(response)
-                print()  # Blank line before response
-                TypewriterEffect.print(formatted)
-                print(C.RESET, end="")  # Ensure color reset
+                # Display response
+                # v5.0.0: In streaming mode, response was already printed live.
+                # Only use TypewriterEffect for non-streaming mode.
+                if not self.streaming_enabled:
+                    formatted = self.formatter.format(response)
+                    print()  # Blank line before response
+                    TypewriterEffect.print(formatted)
+                    print(C.RESET, end="")
+                else:
+                    # Streaming already printed the raw response;
+                    # just ensure color reset
+                    print(C.RESET, end="")
 
                 # Show metadata footer (Claude Code style)
                 model_str = self.current_model or "?"
